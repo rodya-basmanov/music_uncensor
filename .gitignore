@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+data/cache/
+*.mp3
+track_page_raw.html
+_check_search.py
+test_mp3party.py
+test_mp3party_v2.py
+.vscode/
+.idea/

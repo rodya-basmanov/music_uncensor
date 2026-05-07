@@ -1,0 +1,9 @@
+aiogram>=3.0,<4.0
+vk-api>=11.10.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=4.9
+rapidfuzz>=3.5
+python-dotenv>=1.0
+aiofiles>=23.0
+structlog>=24.0
