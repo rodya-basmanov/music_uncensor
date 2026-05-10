@@ -1,9 +1,12 @@
 aiogram>=3.0,<4.0
-vk-api>=11.10.0
+aiohttp-socks>=0.8
 requests>=2.31
 beautifulsoup4>=4.12
 lxml>=4.9
 rapidfuzz>=3.5
 python-dotenv>=1.0
-aiofiles>=23.0
 structlog>=24.0
+playwright>=1.40
+tinytag>=1.10
+yt-dlp>=2024.1
+imageio-ffmpeg>=0.4.0
