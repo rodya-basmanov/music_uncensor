@@ -5,15 +5,19 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Config:
     """Конфигурация приложения."""
     # Telegram
     bot_token: str = ""
-
-    # VK
-    vk_token: str = ""
-    vk_user_id: int = 0
+    telegram_proxy_url: str = ""
 
     # Matching
     fuzzy_threshold: int = 85
@@ -38,8 +42,7 @@ def load_config() -> Config:
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", ""),
-        vk_token=os.getenv("VK_TOKEN", ""),
-        vk_user_id=int(os.getenv("VK_USER_ID", "0")),
+        telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL", ""),
         fuzzy_threshold=int(os.getenv("FUZZY_THRESHOLD", "85")),
         max_playlist_size=int(os.getenv("MAX_PLAYLIST_SIZE", "100")),
         cache_dir=os.getenv("CACHE_DIR", "./data/cache"),

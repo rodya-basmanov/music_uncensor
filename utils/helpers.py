@@ -15,6 +15,32 @@ class Track:
     duration: int = 0
 
 
+def parse_track_line(line: str) -> Optional[Track]:
+    """
+    Парсит строку вида 'Artist - Title [duration_sec]'.
+    Формат script.js: Artist - Title [123].
+    Duration опционально.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+
+    # Извлекаем duration из [число] в конце строки
+    duration = 0
+    duration_match = re.search(r'\[(\d+)\]\s*$', line)
+    if duration_match:
+        duration = int(duration_match.group(1))
+        line = line[:duration_match.start()].strip()
+
+    # Пробуем разделить по первому ' - '
+    parts = line.split(" - ", 1)
+    if len(parts) == 2:
+        artist, title = parts[0].strip(), parts[1].strip()
+        if artist and title:
+            return Track(artist=artist, title=title, duration=duration)
+    return None
+
+
 # Пул User-Agent для ротации
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -37,41 +63,32 @@ def random_ua() -> str:
     return random.choice(USER_AGENTS)
 
 
-def parse_vk_playlist_url(url: str) -> Optional[Tuple[int, int, Optional[str]]]:
-    """
-    Парсит ссылку на плейлист ВК.
-    
-    Поддерживаемые форматы:
-    - https://vk.com/music/playlist/OWNER_ID_PLAYLIST_ID
-    - https://vk.com/music/playlist/OWNER_ID_PLAYLIST_ID_ACCESS_KEY
-    - https://vk.com/audio?act=audio_playlist_OWNER_ID_PLAYLIST_ID
-    - https://vk.com/music/album/OWNER_ID_ALBUM_ID_ACCESS_KEY
-    
-    Returns:
-        (owner_id, playlist_id, access_key) или None
-    """
-    url = url.strip()
-    
-    # Формат: /music/playlist/OWNER_PLAYLIST или /music/album/OWNER_ALBUM
-    match = re.search(
-        r'vk\.com/music/(?:playlist|album)/(-?\d+)_(\d+)(?:_([a-zA-Z0-9]+))?',
-        url
-    )
-    if match:
-        owner_id = int(match.group(1))
-        playlist_id = int(match.group(2))
-        access_key = match.group(3)
-        return (owner_id, playlist_id, access_key)
-    
-    # Формат: audio?act=audio_playlist_OWNER_PLAYLIST
-    match = re.search(
-        r'act=audio_playlist(-?\d+)_(\d+)(?:%2F|/|_)([a-zA-Z0-9]+)?',
-        url
-    )
-    if match:
-        owner_id = int(match.group(1))
-        playlist_id = int(match.group(2))
-        access_key = match.group(3)
-        return (owner_id, playlist_id, access_key)
-    
-    return None
+
+def clean_artist_for_search(artist: str) -> str:
+    """Очищает имя артиста для поиска: убирает соавторов после запятой."""
+    if not artist:
+        return ""
+    # Убираем соавторов через запятую (оставляем первого)
+    cleaned = re.sub(r",\s+.+$", "", artist)
+    # Убираем feat./ft./featuring и всё после
+    cleaned = re.sub(r"\s*(?:feat\.?|ft\.?|featuring)\s+.+$", "", cleaned, flags=re.IGNORECASE)
+    # Убираем prod./produced by и всё после
+    cleaned = re.sub(r"\s*(?:prod\.?|produced by)\s+.+$", "", cleaned, flags=re.IGNORECASE)
+    # Убираем x/& между артистами
+    cleaned = re.sub(r"\s*(?:\sx\s|&\s).+$", "", cleaned)
+    return cleaned.strip()
+
+
+def clean_title_for_search(title: str) -> str:
+    """Очищает название трека для поиска: убирает (feat...), (prod...), prod. by."""
+    if not title:
+        return ""
+    cleaned = title
+    # Убираем скобки с feat/prod/remix/live/explicit
+    cleaned = re.sub(r"\s*\([^)]*(?:feat\.?|ft\.?|featuring|prod\.?|produced by|remix|live|explicit|censor|radio edit)[^)]*\)", "", cleaned, flags=re.IGNORECASE)
+    # Убираем feat./ft. и всё после (в названии)
+    cleaned = re.sub(r"\s*(?:feat\.?|ft\.?|featuring)\s+.+$", "", cleaned, flags=re.IGNORECASE)
+    # Убираем prod./produced by и всё после (в названии)
+    cleaned = re.sub(r"\s*(?:prod\.?|produced by)\s+.+$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+

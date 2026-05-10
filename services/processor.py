@@ -13,9 +13,11 @@ from aiogram import Bot
 from core.cache_manager import CacheManager
 from core.downloader import Downloader
 from core.matcher import match_track
+from tinytag import TinyTag
 from core.scraper.mp3party import Mp3PartyScraper
+from core.scraper.soundcloud import search_and_download as sc_search_download
 from services.tg_sender import TelegramSender
-from utils.helpers import Track, generate_hash
+from utils.helpers import Track, generate_hash, clean_artist_for_search, clean_title_for_search
 from utils.logger import get_logger
 
 log = get_logger("processor")
@@ -217,29 +219,136 @@ async def _process_single_track(
                     cache_mgr.save_file_id(hash_key, new_file_id)
                 return "sent_cached_file"
 
-        # 2. Ищем на mp3party
-        results = await scraper.search_async(track.artist, track.title)
-        if not results:
-            log.info("track_not_found_on_mp3party", artist=track.artist, title=track.title)
-            return "not_found"
+        # 2. Подготавливаем поисковые запросы (чистые — без feat./prod.)
+        search_artist = clean_artist_for_search(track.artist)
+        search_title = clean_title_for_search(track.title)
 
-        # 3. Fuzzy-матчинг
-        candidates = [
-            {"artist": r.artist, "title": r.title, "mp3_url": r.mp3_url, "page_url": r.page_url}
-            for r in results
-        ]
-        best = match_track(track.artist, track.title, candidates, fuzzy_threshold)
+        # 3. Пробуем SoundCloud (основной источник)
+        sc_dir = os.path.join("./data/cache", "sc")
+        os.makedirs(sc_dir, exist_ok=True)
+        sc_path = await asyncio.to_thread(
+            sc_search_download, search_artist, search_title, sc_dir, track.duration
+        )
+        if sc_path:
+            # Переименовываем sc_tmp.mp3 в {hash}.mp3 чтобы не перезаписывать
+            final_sc_path = os.path.join(sc_dir, f"{hash_key}.mp3")
+            if sc_path != final_sc_path and os.path.exists(sc_path):
+                if os.path.exists(final_sc_path):
+                    os.remove(final_sc_path)
+                os.rename(sc_path, final_sc_path)
+                sc_path = final_sc_path
+            file_id = await sender.send_file(channel_id, sc_path, track)
+            cache_mgr.save(hash_key, {
+                "artist": track.artist,
+                "title": track.title,
+                "file_path": sc_path,
+                "telegram_file_id": file_id or "",
+                "source": "soundcloud",
+                "file_size": os.path.getsize(sc_path),
+                "downloaded_at": int(time.time()),
+            })
+            return "sent_new"
+
+        # 4. SoundCloud не нашёл — fallback на mp3party
+        log.info("soundcloud_not_found_mp3party_fallback", artist=track.artist, title=track.title)
+        results = await scraper.search_async(search_artist, search_title)
+        best = None
+        candidates = []
+
+        if results:
+            candidates = [
+                {"artist": r.artist, "title": r.title, "mp3_url": r.mp3_url, "page_url": r.page_url}
+                for r in results
+            ]
+            best = match_track(search_artist, search_title, candidates, fuzzy_threshold)
+
         if not best:
-            log.info("track_no_fuzzy_match", artist=track.artist, title=track.title)
+            log.info("track_not_found_anywhere", artist=track.artist, title=track.title)
             return "not_found"
 
         # 4. Задержка между поиском и скачиванием
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        await asyncio.sleep(random.uniform(2.0, 4.0))
 
-        # 5. Скачиваем
-        file_path = await downloader.download_async(best["mp3_url"], hash_key)
+        # 5. Скачиваем: пробуем best match, затем fallback на других кандидатах
+        file_path = None
+        all_candidates = [best] + [c for c in candidates if c != best]
+        for candidate in all_candidates[:3]:  # Max 3 попытки
+            file_path = await downloader.download_async(
+                candidate["mp3_url"], hash_key, candidate.get("page_url", "")
+            )
+            if file_path:
+                best = candidate
+                break
+            log.info("download_candidate_failed", url=candidate["mp3_url"], trying_next=True)
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+
         if not file_path:
+            log.warning("download_failed_all_candidates", artist=track.artist, title=track.title)
             return "error"
+
+        # 5.5 Проверяем длительность если есть в VK
+        if track.duration > 0:
+            try:
+                tag = TinyTag.get(file_path)
+                if tag.duration:
+                    diff = abs(tag.duration - track.duration)
+                    if diff > 5:
+                        log.warning(
+                            "duration_mismatch",
+                            artist=track.artist,
+                            title=track.title,
+                            expected=track.duration,
+                            actual=round(tag.duration),
+                            diff=round(diff),
+                        )
+                        # Удаляем файл и пробуем следующего кандидата
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                        # Пробуем остальных кандидатов
+                        remaining = [c for c in all_candidates if c != best and c not in all_candidates[:all_candidates.index(best)+1]]
+                        for candidate in remaining[:2]:
+                            file_path = await downloader.download_async(
+                                candidate["mp3_url"], hash_key, candidate.get("page_url", "")
+                            )
+                            if file_path:
+                                try:
+                                    tag2 = TinyTag.get(file_path)
+                                    if tag2.duration and abs(tag2.duration - track.duration) <= 5:
+                                        best = candidate
+                                        break
+                                except Exception:
+                                    break
+                            log.info("duration_retry_failed", url=candidate["mp3_url"])
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        else:
+                            file_path = None
+                        if not file_path:
+                            log.warning("duration_all_candidates_mismatch", artist=track.artist, title=track.title)
+                            # Пробуем SoundCloud как fallback
+                            sc_path = await asyncio.to_thread(
+                                sc_search_download, search_artist, search_title, sc_dir, track.duration
+                            )
+                            if sc_path:
+                                final_sc_path = os.path.join(sc_dir, f"{hash_key}.mp3")
+                                if sc_path != final_sc_path and os.path.exists(sc_path):
+                                    if os.path.exists(final_sc_path):
+                                        os.remove(final_sc_path)
+                                    os.rename(sc_path, final_sc_path)
+                                    sc_path = final_sc_path
+                                file_id = await sender.send_file(channel_id, sc_path, track)
+                                cache_mgr.save(hash_key, {
+                                    "artist": track.artist,
+                                    "title": track.title,
+                                    "file_path": sc_path,
+                                    "telegram_file_id": file_id or "",
+                                    "source": "soundcloud",
+                                    "file_size": os.path.getsize(sc_path),
+                                    "downloaded_at": int(time.time()),
+                                })
+                                return "sent_new"
+                            return "error"
+            except Exception as e:
+                log.warning("duration_check_error", error=str(e))
 
         # 6. Отправляем
         file_id = await sender.send_file(channel_id, file_path, track)
