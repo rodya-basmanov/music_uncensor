@@ -25,44 +25,56 @@ def set_storage(storage: UserStorage) -> None:
 @router.message(Command("link"))
 async def cmd_link(message: Message):
     """
-    /link — получает chat_id текущего чата и привязывает канал.
-    
-    Работает в каналах/группах, где бот — админ.
-    В ЛС показывает инструкцию.
-    """
-    chat_id = message.chat.id
-    chat_type = message.chat.type
+    /link — привязывает канал.
 
-    # Если команда в ЛС — показываем инструкцию
+    В ЛС: /link -100XXXXXXXXXX — привязывает канал по ID
+    В канале: /link — привязывает текущий канал
+    """
+    chat_type = message.chat.type
+    user_id = message.from_user.id if message.from_user else None
+
+    # В ЛС — ожидаем chat_id как аргумент
     if chat_type == "private":
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.answer(
+                "📋 Использование:\n"
+                "<code>/link -100XXXXXXXXXX</code> — привязать канал\n\n"
+                "Или отправьте /link <b>в канале</b>, где бот — администратор.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        try:
+            channel_id = int(args[1].strip())
+        except ValueError:
+            await message.answer("❌ Неверный формат chat_id. Должно быть число.")
+            return
+        if abs(channel_id) < 100:
+            await message.answer("❌ Неверный chat_id.")
+            return
+        if _storage and user_id:
+            _storage.add_channel(user_id, channel_id)
         await message.answer(
-            "ℹ️ Эту команду нужно отправить <b>в канале</b>, где бот — администратор.\n\n"
-            "Бот ответит числовым chat_id канала, который нужно использовать "
-            "при отправке плейлиста.",
+            f"✅ Канал <code>{channel_id}</code> привязан и установлен по умолчанию.\n\n"
+            f"Теперь просто отправляйте треки — они пойдут в этот канал.\n"
+            f"Сменить канал: <code>/link -100XXXXXXXXXX</code>",
             parse_mode=ParseMode.HTML,
         )
+        log.info("link_command_dm", chat_id=channel_id, user_id=user_id)
         return
 
     # В канале/группе — сохраняем привязку
-    # sender_chat для каналов, from_user для групп
-    user_id = None
-    if message.from_user:
-        user_id = message.from_user.id
-    elif message.sender_chat:
-        # В каналах from_user может быть None, 
-        # сообщаем chat_id без привязки к пользователю
-        pass
-
+    chat_id = message.chat.id
     if _storage and user_id:
         _storage.add_channel(user_id, chat_id)
 
     await message.answer(
         f"✅ Chat ID этого канала:\n"
         f"<code>{chat_id}</code>\n\n"
-        f"Скопируйте и отправьте боту в ЛС вместе со ссылкой на плейлист.",
+        f"Канал привязан и установлен по умолчанию.",
         parse_mode=ParseMode.HTML,
     )
-    log.info("link_command", chat_id=chat_id, user_id=user_id)
+    log.info("link_command_channel", chat_id=chat_id, user_id=user_id)
 
 
 @router.message(Command("channels"))
@@ -86,9 +98,12 @@ async def cmd_channels(message: Message):
         return
 
     lines = ["📋 <b>Ваши каналы:</b>\n"]
+    default = _storage.get_default_channel(user_id)
     for ch_id in channels:
-        lines.append(f"  • <code>{ch_id}</code>")
-    lines.append("\nДля отвязки: /unlink <code>&lt;chat_id&gt;</code>")
+        marker = " ⭐" if ch_id == default else ""
+        lines.append(f"  • <code>{ch_id}</code>{marker}")
+    lines.append("\nСменить канал по умолчанию: /link <code>&lt;chat_id&gt;</code>")
+    lines.append("Для отвязки: /unlink <code>&lt;chat_id&gt;</code>")
 
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 

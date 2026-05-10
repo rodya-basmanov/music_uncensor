@@ -1,6 +1,10 @@
-"""Хендлер приёма ссылки на плейлист VK и запуска обработки."""
+"""Хендлер приёма плейлиста (.txt или текст) и запуска обработки.
 
-import re
+Формат: Artist - Title (каждый трек с новой строки).
+Источник: script.js → VK Music → .txt → бот."""
+
+import os
+import tempfile
 
 from aiogram import Router, F
 from aiogram.types import Message
@@ -9,9 +13,8 @@ from aiogram.enums import ParseMode
 from core.cache_manager import CacheManager
 from core.downloader import Downloader
 from core.scraper.mp3party import Mp3PartyScraper
-from core.vk_fetcher import VKFetcher
 from services.processor import process_playlist, is_user_busy
-from utils.helpers import parse_vk_playlist_url
+from utils.helpers import Track, parse_track_line
 from utils.logger import get_logger
 from utils.storage import UserStorage
 
@@ -19,8 +22,6 @@ log = get_logger("playlist_handler")
 
 router = Router()
 
-# Зависимости — инжектятся при инициализации
-_vk_fetcher: VKFetcher | None = None
 _scraper: Mp3PartyScraper | None = None
 _downloader: Downloader | None = None
 _cache_mgr: CacheManager | None = None
@@ -31,7 +32,6 @@ _rate_limit: float = 2.0
 
 
 def set_dependencies(
-    vk_fetcher: VKFetcher,
     scraper: Mp3PartyScraper,
     downloader: Downloader,
     cache_mgr: CacheManager,
@@ -41,9 +41,8 @@ def set_dependencies(
     rate_limit: float = 2.0,
 ) -> None:
     """Устанавливает зависимости (вызывается при инициализации бота)."""
-    global _vk_fetcher, _scraper, _downloader, _cache_mgr, _storage
+    global _scraper, _downloader, _cache_mgr, _storage
     global _fuzzy_threshold, _max_playlist_size, _rate_limit
-    _vk_fetcher = vk_fetcher
     _scraper = scraper
     _downloader = downloader
     _cache_mgr = cache_mgr
@@ -53,98 +52,81 @@ def set_dependencies(
     _rate_limit = rate_limit
 
 
-# Фильтр: ЛС + текст содержит vk.com
-@router.message(F.chat.type == "private", F.text.contains("vk.com"))
-async def handle_playlist_link(message: Message):
-    """Обрабатывает сообщение с chat_id + ссылкой на плейлист VK."""
-    text = message.text.strip()
+def _parse_tracks(text: str) -> list[Track]:
+    """Парсит строки формата Title - Artist в список Track."""
+    tracks: list[Track] = []
+    for line in text.splitlines():
+        track = parse_track_line(line)
+        if track:
+            tracks.append(track)
+    return tracks
+
+
+def _is_valid_channel_id(channel_id: int) -> bool:
+    """Проверяет, является ли ID валидным Telegram chat ID."""
+    return abs(channel_id) >= 100
+
+
+def _resolve_channel_id(text: str | None, user_id: int) -> int | None:
+    """Определяет channel_id: из hint в тексте, иначе из default_channel."""
+    # 1. Если в тексте указан chat_id — используем его
+    if text:
+        parts = text.strip().split(maxsplit=1)
+        if parts:
+            try:
+                cid = int(parts[0])
+                if _is_valid_channel_id(cid):
+                    return cid
+            except ValueError:
+                pass
+    # 2. Канал по умолчанию из storage
+    default = _storage.get_default_channel(user_id)
+    if default and _is_valid_channel_id(default):
+        return default
+    return None
+
+
+async def _start_processing(message: Message, raw_text: str, channel_hint: str | None = None):
+    """Общий цикл: парсинг треков, определение канала, запуск задачи."""
     user_id = message.from_user.id
 
-    # Проверяем зависимости
-    if not all([_vk_fetcher, _scraper, _downloader, _cache_mgr, _storage]):
-        await message.answer("⚠️ Бот не полностью инициализирован. Попробуйте позже.")
-        return
-
-    # Парсим: <chat_id> <url>
-    parts = text.split(maxsplit=1)
-    
-    # Если только URL без chat_id — берём первый привязанный канал
-    if len(parts) == 1:
-        channels = _storage.get_channels(user_id)
-        if not channels:
-            await message.answer(
-                "❌ Укажите chat_id канала перед ссылкой:\n"
-                "<code>-100XXXXXXXXXX ссылка_на_плейлист</code>\n\n"
-                "Или привяжите канал через /link",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        channel_id = channels[0]
-        vk_url = parts[0]
-    else:
-        # Первая часть — chat_id, вторая — URL
-        try:
-            channel_id = int(parts[0])
-        except ValueError:
-            # Может быть URL первым — пробуем наоборот
-            channels = _storage.get_channels(user_id)
-            if not channels:
-                await message.answer(
-                    "❌ Неверный формат. Отправьте:\n"
-                    "<code>-100XXXXXXXXXX ссылка_на_плейлист</code>",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            channel_id = channels[0]
-            vk_url = text
-        else:
-            vk_url = parts[1]
-
-    # Валидация ссылки VK
-    parsed = parse_vk_playlist_url(vk_url)
-    if not parsed:
+    tracks = _parse_tracks(raw_text)
+    if not tracks:
         await message.answer(
-            "❌ Не удалось распознать ссылку на плейлист VK.\n\n"
-            "Поддерживаемые форматы:\n"
-            "• <code>https://vk.com/music/playlist/123_456</code>\n"
-            "• <code>https://vk.com/music/playlist/123_456_accesskey</code>",
+            "❌ Не найдено треков. Убедитесь, что формат строк: <code>Исполнитель - Название</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    owner_id, playlist_id, access_key = parsed
+    if len(tracks) > _max_playlist_size:
+        tracks = tracks[:_max_playlist_size]
+        await message.answer(
+            f"⚠️ Больше {_max_playlist_size} треков. Обработаю первые {len(tracks)}."
+        )
 
-    # Проверяем, не занят ли пользователь
     if is_user_busy(user_id):
-        await message.answer("⏳ У вас уже есть активная задача. Дождитесь её завершения или проверьте /status.")
+        await message.answer(
+            "⏳ У вас уже есть активная задача. Дождитесь её завершения или проверьте /status."
+        )
         return
 
-    # Проверяем, что канал привязан к пользователю
+    channel_id = _resolve_channel_id(channel_hint, user_id)
+    if channel_id is None:
+        await message.answer(
+            "❌ Не удалось определить канал.\n\n"
+            "Привяжите канал командой:\n"
+            "<code>/link -100XXXXXXXXXX</code>\n\n"
+            "Или укажите <code>chat_id</code> перед треками:\n"
+            "<code>-100XXXXXXXXXX\nИсполнитель - Название</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if not _storage.has_channel(user_id, channel_id):
-        # Если канал не привязан, пробуем добавить (пользователь мог не делать /link)
         _storage.add_channel(user_id, channel_id)
 
-    # Получаем треки из VK
-    await message.answer("🔍 Получаю треки из плейлиста VK...")
+    await message.answer(f"🎵 Найдено треков: {len(tracks)}. Запускаю обработку...")
 
-    try:
-        tracks = await _vk_fetcher.get_playlist_tracks_async(
-            owner_id, playlist_id, access_key, count=_max_playlist_size,
-        )
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при получении плейлиста из VK: {str(e)[:200]}")
-        return
-
-    if not tracks:
-        await message.answer(
-            "❌ Плейлист пуст или недоступен.\n\n"
-            "Убедитесь, что:\n"
-            "• Ссылка верна\n"
-            "• Плейлист публичный или у бота есть доступ",
-        )
-        return
-
-    # Запускаем обработку
     task_id = await process_playlist(
         user_id=user_id,
         channel_id=channel_id,
@@ -173,3 +155,62 @@ async def handle_playlist_link(message: Message):
         channel_id=channel_id,
         tracks=len(tracks),
     )
+
+
+@router.message(F.chat.type == "private", F.document)
+async def handle_playlist_file(message: Message):
+    """Принимает .txt файл со списком треков."""
+    document = message.document
+    if not document or not document.file_name:
+        await message.answer("❌ Не удалось определить файл.")
+        return
+
+    if not document.file_name.lower().endswith(".txt"):
+        await message.answer("❌ Пожалуйста, отправьте файл в формате <b>.txt</b>.", parse_mode=ParseMode.HTML)
+        return
+
+    if not all([_scraper, _downloader, _cache_mgr, _storage]):
+        await message.answer("⚠️ Бот не полностью инициализирован. Попробуйте позже.")
+        return
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+            tmp_path = tmp.name
+        await message.bot.download(document.file_id, destination=tmp_path)
+
+        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:
+        log.error("file_download_error", error=str(e))
+        await message.answer("❌ Ошибка при скачивании файла.")
+        return
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Первую строку файла можно использовать как hint для channel_id, если это число
+    first_line = content.splitlines()[0] if content else ""
+    await _start_processing(message, content, channel_hint=first_line)
+
+
+@router.message(F.chat.type == "private", F.text & ~F.text.startswith("/"))
+async def handle_playlist_text(message: Message):
+    """Обработка текстового плейлиста из сообщения (не команда)."""
+    text = message.text or ""
+    if not all([_scraper, _downloader, _cache_mgr, _storage]):
+        await message.answer("⚠️ Бот не полностью инициализирован. Попробуйте позже.")
+        return
+
+    # Если первое слово — chat_id, отделяем его
+    lines = text.splitlines()
+    channel_hint = lines[0] if lines else None
+    # Если первая строка выглядит как chat_id — убираем её из треков
+    if channel_hint and channel_hint.strip().lstrip("-").isdigit():
+        raw_text = "\n".join(lines[1:])
+    else:
+        raw_text = text
+        channel_hint = None
+
+    await _start_processing(message, raw_text, channel_hint=channel_hint)

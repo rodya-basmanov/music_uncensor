@@ -58,15 +58,47 @@ class Mp3PartyScraper:
     def search(self, artist: str, title: str) -> List[Mp3PartyTrack]:
         """
         Ищет треки на mp3party.net.
-        
+
+        Пробует несколько вариантов запроса и объединяет результаты.
+
         Args:
             artist: Имя артиста
             title: Название трека
-            
+
         Returns:
             Список найденных треков с прямыми ссылками на mp3
         """
-        query = f"{artist} {title}"
+        all_results = []
+        existing_ids = set()
+
+        def add_unique(new_results):
+            for r in new_results:
+                if r.track_id not in existing_ids:
+                    all_results.append(r)
+                    existing_ids.add(r.track_id)
+
+        # 1. Поиск "Artist Title"
+        add_unique(self._do_search(f"{artist} {title}"))
+
+        # 2. Поиск "Title Artist" — mp3party часто ищет лучше в этом порядке
+        add_unique(self._do_search(f"{title} {artist}"))
+
+        # 3. Поиск по артисту
+        if len(all_results) < 5:
+            add_unique(self._do_search(artist))
+
+        # 4. Поиск по названию
+        if len(all_results) < 5:
+            add_unique(self._do_search(title))
+
+        log.info("mp3party_search_done", query=f"{artist} {title}", results=len(all_results))
+        return all_results
+
+    def _do_search(self, query: str) -> List[Mp3PartyTrack]:
+        """Выполняет один поисковый запрос к mp3party.net."""
+        # Убираем точки — mp3party ищет лучше без них (J. ROUH → J ROUH)
+        query = query.replace(".", " ").replace("  ", " ").strip()
+
         self._update_headers()
 
         try:
@@ -77,13 +109,12 @@ class Mp3PartyScraper:
             )
             response.raise_for_status()
         except requests.RequestException as e:
-            log.error("mp3party_search_failed", query=query, error=str(e))
+            log.warning("mp3party_search_failed", query=query, error=str(e))
             return []
 
         soup = BeautifulSoup(response.text, "lxml")
         results = []
 
-        # Парсим элементы с data-js-url (прямые ссылки на mp3)
         for item in soup.find_all(attrs={"data-js-url": True}):
             track_artist = item.get("data-js-artist-name", "").strip()
             track_title = item.get("data-js-song-title", "").strip()
@@ -99,7 +130,6 @@ class Mp3PartyScraper:
                     page_url=f"{self.BASE_URL}/music/{track_id}",
                 ))
 
-        log.info("mp3party_search_done", query=query, results=len(results))
         return results
 
     async def search_async(self, artist: str, title: str) -> List[Mp3PartyTrack]:

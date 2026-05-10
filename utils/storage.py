@@ -46,13 +46,17 @@ class UserStorage:
             raise
 
     def add_channel(self, user_id: int, channel_id: int) -> None:
-        """Привязывает канал к пользователю."""
+        """Привязывает канал к пользователю и делает его каналом по умолчанию."""
+        if abs(channel_id) < 100:
+            log.warning("invalid_channel_id_rejected", user_id=user_id, channel_id=channel_id)
+            return
         data = self._read()
         uid = str(user_id)
         if uid not in data:
             data[uid] = {"channels": [], "last_active": 0, "tasks_done": 0}
         if channel_id not in data[uid]["channels"]:
             data[uid]["channels"].append(channel_id)
+        data[uid]["default_channel"] = channel_id
         data[uid]["last_active"] = int(time.time())
         self._write(data)
         log.info("channel_linked", user_id=user_id, channel_id=channel_id)
@@ -79,6 +83,19 @@ class UserStorage:
     def has_channel(self, user_id: int, channel_id: int) -> bool:
         """Проверяет, привязан ли канал к пользователю."""
         return channel_id in self.get_channels(user_id)
+
+    def get_default_channel(self, user_id: int) -> Optional[int]:
+        """Возвращает канал по умолчанию или первый из списка."""
+        data = self._read()
+        uid = str(user_id)
+        if uid in data:
+            default = data[uid].get("default_channel")
+            if default:
+                return default
+            channels = data[uid].get("channels", [])
+            if channels:
+                return channels[0]
+        return None
 
     def increment_tasks(self, user_id: int) -> None:
         """Увеличивает счётчик выполненных задач."""
