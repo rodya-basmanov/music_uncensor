@@ -1,6 +1,6 @@
-aiogram>=3.0,<4.0
+aiogram==3.4
+aiohttp>=3.9
 aiohttp-socks>=0.8
-requests>=2.31
 beautifulsoup4>=4.12
 lxml>=4.9
 rapidfuzz>=3.5
@@ -10,3 +10,4 @@ playwright>=1.40
 tinytag>=1.10
 yt-dlp>=2024.1
 imageio-ffmpeg>=0.4.0
+sentry-sdk>=1.40

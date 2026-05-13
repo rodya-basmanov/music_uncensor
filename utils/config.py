@@ -35,6 +35,15 @@ class Config:
     # Logging
     log_level: str = "INFO"
 
+    # Sentry
+    sentry_dsn: str = ""
+
+    # Webhook (альтернатива polling)
+    webhook_mode: bool = False
+    webhook_url: str = ""
+    webhook_path: str = "/webhook"
+    webhook_secret: str = ""
+
 
 def load_config() -> Config:
     """Загружает конфигурацию из .env файла."""
@@ -51,4 +60,9 @@ def load_config() -> Config:
         rate_limit_search=float(os.getenv("RATE_LIMIT_SEARCH_SEC", "2")),
         rate_limit_download=float(os.getenv("RATE_LIMIT_DOWNLOAD_SEC", "2")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        sentry_dsn=os.getenv("SENTRY_DSN", ""),
+        webhook_mode=_env_bool("WEBHOOK_MODE", False),
+        webhook_url=os.getenv("WEBHOOK_URL", ""),
+        webhook_path=os.getenv("WEBHOOK_PATH", "/webhook"),
+        webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
     )
