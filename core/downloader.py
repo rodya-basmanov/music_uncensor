@@ -78,17 +78,19 @@ class Downloader:
         self._pw_browser = None
         self._pw = None
 
-    def download(self, url: str, hash_key: str, track_page_url: str = "") -> Optional[str]:
+    def download(self, url: str, hash_key: str, track_page_url: str = "", max_retries: int = 3) -> Optional[str]:
         """
-        Скачивает файл по URL.
+        Скачивает файл по URL с retry.
 
         1. Пробует requests (быстро)
         2. Если битый — Playwright XHR fallback
+        3. Повторяет несколько раз при неудаче
 
         Args:
             url: Прямая ссылка на mp3
             hash_key: SHA256-хеш для имени файла
             track_page_url: URL страницы трека (для Referer)
+            max_retries: Количество попыток
 
         Returns:
             Путь к скачанному файлу или None при ошибке
@@ -100,22 +102,29 @@ class Downloader:
             log.info("file_already_exists", path=dest_path)
             return dest_path
 
-        # Удаляем битый файл
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
+        for attempt in range(max_retries):
+            # Удаляем битый файл перед каждой попыткой
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
 
-        referer = track_page_url or "https://mp3party.net/"
+            referer = track_page_url or "https://mp3party.net/"
 
-        # 1. Быстрая попытка через requests
-        result = self._download_with_requests(url, dest_path, referer)
-        if result:
-            return result
+            # 1. Быстрая попытка через requests
+            result = self._download_with_requests(url, dest_path, referer)
+            if result:
+                return result
 
-        # 2. Playwright XHR fallback
-        log.info("playwright_fallback", url=url)
-        result = self._download_with_playwright_xhr(url, dest_path, track_page_url)
-        if result:
-            return result
+            # 2. Playwright XHR fallback
+            log.info("playwright_fallback_attempt", url=url, attempt=attempt + 1)
+            result = self._download_with_playwright_xhr(url, dest_path, track_page_url)
+            if result:
+                return result
+
+            log.warning("download_attempt_failed", url=url, attempt=attempt + 1, max_retries=max_retries)
+
+            # Пауза между попытками (кроме последней)
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)  # 1 сек, 2 сек, 3 сек...
 
         log.warning("download_failed_all_methods", url=url)
         return None

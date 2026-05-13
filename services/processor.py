@@ -23,6 +23,17 @@ from utils.logger import get_logger
 log = get_logger("processor")
 
 
+def _format_duration(seconds: int) -> str:
+    """Форматирует секунды в читаемый вид: 5ч 30мин."""
+    if seconds < 60:
+        return f"{seconds} сек"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours}ч {minutes}мин"
+    return f"{minutes}мин"
+
+
 @dataclass
 class TaskStatus:
     """Статус задачи обработки плейлиста."""
@@ -37,6 +48,7 @@ class TaskStatus:
     errors: int = 0
     failed_tracks: List[str] = field(default_factory=list)
     done: bool = False
+    cancelled: bool = False
     started_at: float = 0.0
 
 
@@ -44,6 +56,21 @@ class TaskStatus:
 _tasks: Dict[str, TaskStatus] = {}
 # Активные задачи по user_id (для ограничения 1 задача/юзер)
 _active_users: set = set()
+
+# Статистика (глобальная)
+_stats = {
+    "total_playlists": 0,  # Всего плейлистов обработано
+    "total_tracks": 0,     # Всего треков обработано
+    "total_sent": 0,       # Всего отправлено в каналы
+    "total_cached": 0,     # Всего из кэша
+    "total_not_found": 0,  # Всего не найдено
+    "total_time": 0,       # Общее время в секундах
+}
+
+
+def get_stats() -> dict:
+    """Возвращает статистику использования бота."""
+    return _stats.copy()
 
 
 def get_task_status(task_id: str) -> Optional[TaskStatus]:
@@ -56,20 +83,42 @@ def is_user_busy(user_id: int) -> bool:
     return user_id in _active_users
 
 
+def cancel_user_task(user_id: int) -> str | None:
+    """Отменяет активную задачу пользователя. Returns task_id или None."""
+    if user_id not in _active_users:
+        return None
+
+    # Ищем задачу пользователя
+    for task_id, status in _tasks.items():
+        if status.user_id == user_id and not status.done:
+            status.done = True
+            status.cancelled = True  # Добавляем флаг отмены
+            _active_users.discard(user_id)
+            log.info("task_cancelled", task_id=task_id, user_id=user_id)
+            return task_id
+    return None
+
+
 async def process_playlist(
     user_id: int,
     channel_id: int,
     tracks: List[Track],
-    bot: Bot,
-    cache_mgr: CacheManager,
-    scraper: Mp3PartyScraper,
-    downloader: Downloader,
+    playlist_name: str | None = None,
+    total_duration: int = 0,
+    bot: Bot = None,
+    cache_mgr: CacheManager = None,
+    scraper: Mp3PartyScraper = None,
+    downloader: Downloader = None,
     fuzzy_threshold: int = 85,
     rate_limit: float = 2.0,
 ) -> str:
     """
     Запускает обработку плейлиста как фоновую задачу.
-    
+
+    Args:
+        playlist_name: Название плейлиста (опционально)
+        total_duration: Общая длительность в секундах
+
     Returns:
         task_id
     """
@@ -86,7 +135,7 @@ async def process_playlist(
 
     # Запускаем обработку в фоне
     asyncio.create_task(
-        _process_tracks(status, tracks, bot, cache_mgr, scraper, downloader, fuzzy_threshold, rate_limit)
+        _process_tracks(status, tracks, bot, cache_mgr, scraper, downloader, fuzzy_threshold, rate_limit, playlist_name, total_duration)
     )
 
     return task_id
@@ -101,12 +150,31 @@ async def _process_tracks(
     downloader: Downloader,
     fuzzy_threshold: int,
     rate_limit: float,
+    playlist_name: str | None = None,
+    total_duration: int = 0,
 ) -> None:
     """Внутренний цикл обработки треков."""
     sender = TelegramSender(bot)
 
     try:
+        # Отправляем заголовок плейлиста в канал
+        if playlist_name or total_duration:
+            duration_str = _format_duration(total_duration) if total_duration else "?"
+            if playlist_name:
+                header = f"🎵 <b>{playlist_name}</b>\n📊 {len(tracks)} треков, ~{duration_str}"
+            else:
+                header = f"🎵 Плейлист\n📊 {len(tracks)} треков, ~{duration_str}"
+            try:
+                await bot.send_message(status.channel_id, header, parse_mode="HTML")
+            except Exception as e:
+                log.warning("playlist_header_send_error", error=str(e))
+
         for i, track in enumerate(tracks):
+            # Проверяем не отменена ли задача
+            if status.cancelled:
+                log.info("task_stopped_by_user", task_id=status.task_id, processed=status.processed)
+                break
+
             status.processed = i + 1
             result = await _process_single_track(
                 track, status.channel_id, cache_mgr, scraper,
@@ -147,22 +215,43 @@ async def _process_tracks(
         # Финальный отчёт
         status.done = True
         elapsed = int(time.time() - status.started_at)
-        report = (
-            f"🏁 Плейлист обработан!\n\n"
-            f"📊 Результат ({task_id_display(status.task_id)}):\n"
-            f"  ✅ Отправлено: {status.sent}/{status.total}\n"
-            f"  ⚡ Из кэша: {status.cached}\n"
-            f"  ❌ Не найдено: {status.not_found}\n"
-            f"  ⚠️ Ошибок: {status.errors}\n"
-            f"  ⏱ Время: {elapsed} сек"
-        )
+
+        # Проверяем была ли отмена
+        if status.cancelled:
+            report = (
+                f"⏹️ <b>Задача отменена пользователем</b>\n\n"
+                f"📊 Результат ({task_id_display(status.task_id)}):\n"
+                f"  ✅ Отправлено: {status.sent}/{status.total}\n"
+                f"  ⚡ Из кэша: {status.cached}\n"
+                f"  ⏱ Время: {elapsed} сек"
+            )
+        else:
+            report = (
+                f"🏁 Плейлист обработан!\n\n"
+                f"📊 Результат ({task_id_display(status.task_id)}):\n"
+                f"  ✅ Отправлено: {status.sent}/{status.total}\n"
+                f"  ⚡ Из кэша: {status.cached}\n"
+                f"  ❌ Не найдено: {status.not_found}\n"
+                f"  ⚠️ Ошибок: {status.errors}\n"
+                f"  ⏱ Время: {elapsed} сек"
+            )
+
         if status.failed_tracks:
             report += "\n\n❌ Не найдены:\n"
             for ft in status.failed_tracks[:20]:
                 report += f"  • {ft}\n"
 
+        # Обновляем глобальную статистику
+        if not status.cancelled:
+            _stats["total_playlists"] += 1
+            _stats["total_tracks"] += status.total
+            _stats["total_sent"] += status.sent
+            _stats["total_cached"] += status.cached
+            _stats["total_not_found"] += status.not_found
+            _stats["total_time"] += elapsed
+
         try:
-            await bot.send_message(status.user_id, report)
+            await bot.send_message(status.user_id, report, parse_mode="HTML")
         except Exception as e:
             log.error("report_send_error", error=str(e))
 
@@ -304,8 +393,8 @@ async def _process_single_track(
                         # Удаляем файл и пробуем следующего кандидата
                         if os.path.exists(file_path):
                             os.remove(file_path)
-                        # Пробуем остальных кандидатов
-                        remaining = [c for c in all_candidates if c != best and c not in all_candidates[:all_candidates.index(best)+1]]
+                        # Пробуем остальных кандидатов (все после best)
+                        remaining = all_candidates[1:]  # all_candidates[0] = best, остальные - candidates без best
                         for candidate in remaining[:2]:
                             file_path = await downloader.download_async(
                                 candidate["mp3_url"], hash_key, candidate.get("page_url", "")
