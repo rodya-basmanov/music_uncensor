@@ -11,12 +11,10 @@
 """
 
 import asyncio
-import random
 from dataclasses import dataclass
-from typing import List, Optional
-from urllib.parse import quote
+from typing import List
 
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 
 from utils.helpers import random_ua
@@ -36,28 +34,35 @@ class Mp3PartyTrack:
 
 
 class Mp3PartyScraper:
-    """Скрапер для mp3party.net."""
+    """Скрапер для mp3party.net с использованием aiohttp."""
 
     BASE_URL = "https://mp3party.net"
     SEARCH_URL = f"{BASE_URL}/search"
 
     def __init__(self, rate_limit: float = 2.0):
         self.rate_limit = rate_limit
-        self.session = requests.Session()
-        self._update_headers()
+        self._session: aiohttp.ClientSession | None = None
 
-    def _update_headers(self) -> None:
-        """Обновляет заголовки сессии с рандомным UA."""
-        self.session.headers.update({
-            "User-Agent": random_ua(),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            "Referer": f"{self.BASE_URL}/",
-        })
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Получает или создаёт aiohttp сессию."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={
+                    "User-Agent": random_ua(),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                }
+            )
+        return self._session
 
-    def search(self, artist: str, title: str) -> List[Mp3PartyTrack]:
+    async def close(self) -> None:
+        """Закрывает aiohttp сессию."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def search(self, artist: str, title: str) -> List[Mp3PartyTrack]:
         """
-        Ищет треки на mp3party.net.
+        Ищет треки на mp3party.net (асинхронно).
 
         Пробует несколько вариантов запроса и объединяет результаты.
 
@@ -68,51 +73,59 @@ class Mp3PartyScraper:
         Returns:
             Список найденных треков с прямыми ссылками на mp3
         """
-        all_results = []
-        existing_ids = set()
+        all_results: List[Mp3PartyTrack] = []
+        existing_ids: set = set()
 
-        def add_unique(new_results):
+        async def add_unique(new_results: List[Mp3PartyTrack]) -> None:
             for r in new_results:
                 if r.track_id not in existing_ids:
                     all_results.append(r)
                     existing_ids.add(r.track_id)
 
         # 1. Поиск "Artist Title"
-        add_unique(self._do_search(f"{artist} {title}"))
+        await add_unique(await self._do_search(f"{artist} {title}"))
 
         # 2. Поиск "Title Artist" — mp3party часто ищет лучше в этом порядке
-        add_unique(self._do_search(f"{title} {artist}"))
+        if len(all_results) < 5:
+            await add_unique(await self._do_search(f"{title} {artist}"))
 
         # 3. Поиск по артисту
         if len(all_results) < 5:
-            add_unique(self._do_search(artist))
+            await add_unique(await self._do_search(artist))
 
         # 4. Поиск по названию
         if len(all_results) < 5:
-            add_unique(self._do_search(title))
+            await add_unique(await self._do_search(title))
 
         log.info("mp3party_search_done", query=f"{artist} {title}", results=len(all_results))
         return all_results
 
-    def _do_search(self, query: str) -> List[Mp3PartyTrack]:
+    async def _do_search(self, query: str) -> List[Mp3PartyTrack]:
         """Выполняет один поисковый запрос к mp3party.net."""
         # Убираем точки — mp3party ищет лучше без них (J. ROUH → J ROUH)
         query = query.replace(".", " ").replace("  ", " ").strip()
 
-        self._update_headers()
+        session = await self._get_session()
 
         try:
-            response = self.session.get(
+            async with session.get(
                 self.SEARCH_URL,
                 params={"q": query},
-                timeout=15,
-            )
-            response.raise_for_status()
-        except requests.RequestException as e:
-            log.warning("mp3party_search_failed", query=query, error=str(e))
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status != 200:
+                    log.warning("mp3party_search_failed", query=query, status=response.status)
+                    return []
+
+                html = await response.text()
+        except asyncio.TimeoutError:
+            log.warning("mp3party_search_timeout", query=query)
+            return []
+        except Exception as e:
+            log.warning("mp3party_search_error", query=query, error=str(e))
             return []
 
-        soup = BeautifulSoup(response.text, "lxml")
+        soup = BeautifulSoup(html, "lxml")
         results = []
 
         for item in soup.find_all(attrs={"data-js-url": True}):
@@ -133,6 +146,5 @@ class Mp3PartyScraper:
         return results
 
     async def search_async(self, artist: str, title: str) -> List[Mp3PartyTrack]:
-        """Асинхронная обёртка над search()."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.search, artist, title)
+        """Асинхронный интерфейс для поиска (теперь основной)."""
+        return await self.search(artist, title)
