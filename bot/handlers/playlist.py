@@ -1,14 +1,18 @@
 """Хендлер приёма плейлиста (.txt или текст) и запуска обработки.
 
-Формат: Artist - Title (каждый трек с новой строки).
+Формат:
+Название плейлиста (опционально, первая строка если не chat_id)
+-chat_id (опционально, если указан - используется для отправки)
+Артист - Название (каждый трек с новой строки)
 Источник: script.js → VK Music → .txt → бот."""
 
 import os
 import tempfile
 
 from aiogram import Router, F
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
+from dataclasses import dataclass
 
 from core.cache_manager import CacheManager
 from core.downloader import Downloader
@@ -29,6 +33,15 @@ _storage: UserStorage | None = None
 _fuzzy_threshold: int = 85
 _max_playlist_size: int = 100
 _rate_limit: float = 2.0
+
+
+@dataclass
+class ParsedPlaylist:
+    """Результат парсинга плейлиста."""
+    name: str | None  # Название плейлиста
+    channel_id: int | None  # Chat ID канала
+    tracks: list[Track]  # Список треков
+    total_duration: int  # Общая длительность в секундах
 
 
 def set_dependencies(
@@ -52,8 +65,62 @@ def set_dependencies(
     _rate_limit = rate_limit
 
 
+def _format_duration(seconds: int) -> str:
+    """Форматирует секунды в читаемый вид: 5ч 30мин."""
+    if seconds < 60:
+        return f"{seconds} сек"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours}ч {minutes}мин"
+    return f"{minutes}мин"
+
+
+def _parse_playlist(text: str) -> ParsedPlaylist:
+    """Парсит текст плейлиста: название, chat_id, треки."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    playlist_name: str | None = None
+    channel_id: int | None = None
+    tracks: list[Track] = []
+
+    # Анализируем первые строки
+    for i, line in enumerate(lines):
+        # Если строка похожа на chat_id (начинается с - и число)
+        if line.lstrip("-").isdigit() and len(line) > 3:
+            try:
+                cid = int(line)
+                if abs(cid) >= 100:
+                    channel_id = cid
+                    continue
+            except ValueError:
+                pass
+
+        # Если не chat_id и не трек - это название плейлиста
+        if i == 0 or (i == 1 and channel_id):
+            # Проверяем что это не трек (треки имеют формат "Artist - Title")
+            if " - " not in line:
+                playlist_name = line
+                continue
+
+        # Парсим как трек
+        track = parse_track_line(line)
+        if track:
+            tracks.append(track)
+
+    # Вычисляем общую длительность
+    total_duration = sum(t.duration for t in tracks if t.duration > 0)
+
+    return ParsedPlaylist(
+        name=playlist_name,
+        channel_id=channel_id,
+        tracks=tracks,
+        total_duration=total_duration,
+    )
+
+
 def _parse_tracks(text: str) -> list[Track]:
-    """Парсит строки формата Title - Artist в список Track."""
+    """Парсит строки формата Title - Artist в список Track (для обратной совместимости)."""
     tracks: list[Track] = []
     for line in text.splitlines():
         track = parse_track_line(line)
@@ -90,33 +157,48 @@ async def _start_processing(message: Message, raw_text: str, channel_hint: str |
     """Общий цикл: парсинг треков, определение канала, запуск задачи."""
     user_id = message.from_user.id
 
-    tracks = _parse_tracks(raw_text)
-    if not tracks:
+    # Парсим плейлист (название, chat_id, треки, длительность)
+    parsed = _parse_playlist(raw_text)
+
+    if not parsed.tracks:
         await message.answer(
-            "❌ Не найдено треков. Убедитесь, что формат строк: <code>Исполнитель - Название</code>",
+            "❌ <b>Треки не найдены</b>\n\n"
+            "Проверьте формат: <code>Исполнитель - Название</code>\n"
+            "Каждая строка — один трек.",
             parse_mode=ParseMode.HTML,
         )
         return
 
+    tracks = parsed.tracks
+
     if len(tracks) > _max_playlist_size:
         tracks = tracks[:_max_playlist_size]
         await message.answer(
-            f"⚠️ Больше {_max_playlist_size} треков. Обработаю первые {len(tracks)}."
+            f"⚠️ Больше {_max_playlist_size} треков. Обработаю первые {len(tracks)}.",
         )
 
     if is_user_busy(user_id):
         await message.answer(
-            "⏳ У вас уже есть активная задача. Дождитесь её завершения или проверьте /status."
+            "⏳ <b>Задача уже выполняется</b>\n\n"
+            "Дождитесь завершения текущей обработки.\n"
+            "Проверить статус: /status",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    channel_id = _resolve_channel_id(channel_hint, user_id)
+    # Определяем канал: из плейлиста → из hint → из storage
+    channel_id = parsed.channel_id
+    if channel_id is None and channel_hint:
+        channel_id = _resolve_channel_id(channel_hint, user_id)
+    if channel_id is None:
+        channel_id = _storage.get_default_channel(user_id)
+
     if channel_id is None:
         await message.answer(
-            "❌ Не удалось определить канал.\n\n"
-            "Привяжите канал командой:\n"
+            "❌ <b>Канал не определён</b>\n\n"
+            "Привяжите канал:\n"
             "<code>/link -100XXXXXXXXXX</code>\n\n"
-            "Или укажите <code>chat_id</code> перед треками:\n"
+            "Или укажите chat_id перед треками:\n"
             "<code>-100XXXXXXXXXX\nИсполнитель - Название</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -125,12 +207,12 @@ async def _start_processing(message: Message, raw_text: str, channel_hint: str |
     if not _storage.has_channel(user_id, channel_id):
         _storage.add_channel(user_id, channel_id)
 
-    await message.answer(f"🎵 Найдено треков: {len(tracks)}. Запускаю обработку...")
-
     task_id = await process_playlist(
         user_id=user_id,
         channel_id=channel_id,
         tracks=tracks,
+        playlist_name=parsed.name,
+        total_duration=parsed.total_duration,
         bot=message.bot,
         cache_mgr=_cache_mgr,
         scraper=_scraper,
@@ -139,13 +221,23 @@ async def _start_processing(message: Message, raw_text: str, channel_hint: str |
         rate_limit=_rate_limit,
     )
 
+    # Формируем краткое описание
+    duration_str = _format_duration(parsed.total_duration) if parsed.total_duration else "?"
+    playlist_desc = f"{parsed.name} ({len(tracks)} треков, ~{duration_str})" if parsed.name else f"{len(tracks)} треков, ~{duration_str}"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Проверить статус", callback_data=f"refresh_{task_id}")],
+    ])
+
     await message.answer(
-        f"🚀 Задача создана!\n\n"
-        f"📋 ID задачи: <code>{task_id}</code>\n"
-        f"🎵 Треков: {len(tracks)}\n"
+        f"🚀 <b>Задача запущена!</b>\n\n"
+        f"📋 ID: <code>{task_id}</code>\n"
+        f"🎵 Плейлист: {playlist_desc}\n"
         f"📡 Канал: <code>{channel_id}</code>\n\n"
-        f"Статус: /status <code>{task_id}</code>",
+        f"⏱ Ожидаемое время: {len(tracks) * 3 // 60} мин\n\n"
+        f"📊 Статус: /status {task_id}",
         parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
     )
 
     log.info(
