@@ -2,32 +2,43 @@
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 from aiogram.enums import ParseMode
 
+from utils.logger import get_logger
+from utils.rich import send_rich
 from utils.storage import UserStorage
+
+log = get_logger("start_handler")
 
 router = Router()
 
 _storage: UserStorage | None = None
 
 
+async def _send_menu(chat_id: int, bot, rich_md: str, fallback_html: str, reply_markup) -> None:
+    """Отправляет rich-сообщение (markdown); при неудаче — обычный HTML."""
+    await send_rich(bot, chat_id, rich_md, reply_markup=reply_markup, fallback=fallback_html)
+
+
 @router.callback_query(F.data == "show_guide")
 async def cb_show_guide(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(START_TEXT, parse_mode=ParseMode.HTML, reply_markup=_get_main_keyboard())
+    await _send_menu(callback.message.chat.id, callback.message.bot, START_RICH, START_TEXT, _get_main_keyboard())
 
 
 @router.callback_query(F.data == "show_help")
 async def cb_show_help(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=_get_back_keyboard())
+    await _send_menu(callback.message.chat.id, callback.message.bot, HELP_RICH, HELP_TEXT, _get_back_keyboard())
 
 
 @router.callback_query(F.data == "show_link_help")
 async def cb_show_link_help(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(LINK_HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=_get_back_keyboard())
+    await _send_menu(callback.message.chat.id, callback.message.bot, LINK_HELP_RICH, LINK_HELP_TEXT, _get_back_keyboard())
 
 
 @router.callback_query(F.data == "show_channels")
@@ -53,7 +64,7 @@ async def cb_show_channels(callback: CallbackQuery):
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer("🏠 <b>Главное меню</b>\n\nВыберите действие:", parse_mode=ParseMode.HTML, reply_markup=_get_main_keyboard())
+    await _send_menu(callback.message.chat.id, callback.message.bot, START_RICH, START_TEXT, _get_main_keyboard())
 
 
 def set_storage(storage: UserStorage) -> None:
@@ -64,11 +75,11 @@ def set_storage(storage: UserStorage) -> None:
 def _get_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🔗 Привязать", callback_data="show_link_help"),
-            InlineKeyboardButton(text="📊 Мои каналы", callback_data="show_channels"),
+            InlineKeyboardButton(text="🔗 Привязать", callback_data="show_link_help", style="primary"),
+            InlineKeyboardButton(text="📊 Мои каналы", callback_data="show_channels", style="primary"),
         ],
         [
-            InlineKeyboardButton(text="📖 Инструкция", callback_data="show_guide"),
+            InlineKeyboardButton(text="📖 Инструкция", callback_data="show_guide", style="primary"),
         ],
     ])
 
@@ -102,10 +113,10 @@ HELP_TEXT = """❓ <b>Справка</b>
 
 <b>Команды</b>
 • /start — меню
-• /link — привязать канал (<code>/link -100XXX</code>)
+• /link — привязать канал (/link -100XXX)
 • /channels — мои каналы
-• /unlink <code>-100XXX</code> — отвязать
-• /status <code>id</code> — статус задачи
+• /unlink -100XXX — отвязать
+• /status id — статус задачи
 • /stats — статистика
 • /cancel — отменить задачу
 
@@ -123,14 +134,61 @@ LINK_HELP_TEXT = """🔗 <b>Как привязать канал</b>
 3. Отправь <b>в канале</b> /link
 
 <b>Вручную (в личке)</b>
-<code>/link -100XXXXXXXXXX</code>"""
+/link -100XXXXXXXXXX"""
+
+LINK_HELP_RICH = """# 🔗 Как привязать канал
+
+## Автоматически
+
+1. Приватный канал
+2. Добавь бота админом
+3. Отправь **в канале** /link
+
+## Вручную (в личке)
+
+/link -100XXXXXXXXXX"""
+
+
+START_RICH = """# 🎧 VK Music Uncensor
+
+_Плейлисты ВК → треки без цензуры в твоём канале_
+
+## Как это работает
+
+1. Создай приватный канал и добавь бота админом
+2. Отправь **в канале** `/link` — он привяжется
+3. Пришли боту в личку одно из:
+
+- 🔗 **ссылку** на плейлист ВК
+- 📋 **список** треков (`Артист - Название`)
+- 🎵 **запрос** — покажу варианты на выбор
+
+📊 /status — статус · 📈 /stats — статистика · ❓ /help — все команды"""
+
+HELP_RICH = """# ❓ Справка
+
+## Команды
+
+- /start — меню
+- /link — привязать канал (/link -100XXX)
+- /channels — мои каналы
+- /unlink -100XXX — отвязать
+- /status id — статус задачи
+- /stats — статистика
+- /cancel — отменить задачу
+
+## Отправка треков
+
+- 🔗 ссылка на плейлист ВК — скачаю все треки
+- 📋 текст/файл — по одному треку на строку
+- 🎵 один запрос — покажу результаты, выберешь кнопкой"""
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(START_TEXT, parse_mode=ParseMode.HTML, reply_markup=_get_main_keyboard())
+    await _send_menu(message.chat.id, message.bot, START_RICH, START_TEXT, _get_main_keyboard())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=_get_back_keyboard())
+    await _send_menu(message.chat.id, message.bot, HELP_RICH, HELP_TEXT, _get_back_keyboard())

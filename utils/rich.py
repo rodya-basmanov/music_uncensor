@@ -1,0 +1,65 @@
+"""Хелперы rich-сообщений (Bot API 10.x) с фолбэком на обычный текст/HTML."""
+
+from typing import Optional
+
+from aiogram import Bot
+from aiogram.types import InputRichMessage, InlineKeyboardMarkup
+
+from utils.logger import get_logger
+
+log = get_logger("rich")
+
+
+def rich(md: str) -> InputRichMessage:
+    return InputRichMessage(markdown=md)
+
+
+async def send_rich(
+    bot: Bot,
+    chat_id: int,
+    md: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    fallback: Optional[str] = None,
+    parse_mode: str = "HTML",
+) -> bool:
+    """Отправляет rich-сообщение; при неудаче — обычное (fallback)."""
+    try:
+        await bot.send_rich_message(chat_id=chat_id, rich_message=rich(md), reply_markup=reply_markup)
+        return True
+    except Exception as e:
+        log.warning("rich_send_failed", error=str(e))
+    if fallback is not None:
+        try:
+            await bot.send_message(chat_id, fallback, parse_mode=parse_mode, reply_markup=reply_markup)
+        except Exception as e:
+            log.warning("rich_fallback_send_failed", error=str(e))
+    return False
+
+
+async def edit_rich(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    md: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    fallback: Optional[str] = None,
+    parse_mode: str = "HTML",
+) -> bool:
+    """Редактирует сообщение rich-контентом; при неудаче — обычным текстом."""
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            rich_message=rich(md), reply_markup=reply_markup,
+        )
+        return True
+    except Exception as e:
+        log.warning("rich_edit_failed", error=str(e))
+    if fallback is not None:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=fallback, parse_mode=parse_mode, reply_markup=reply_markup,
+            )
+        except Exception:
+            pass
+    return False

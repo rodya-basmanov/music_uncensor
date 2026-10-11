@@ -36,6 +36,7 @@ from utils.helpers import (
 )
 from utils.ffmpeg import make_thumbnail
 from utils.logger import get_logger
+from utils.rich import send_rich, edit_rich
 from utils.ui import progress_bar, is_mashup, source_icon
 
 log = get_logger("processor")
@@ -113,6 +114,54 @@ _stats = {
     "total_not_found": 0,
     "total_time": 0,
 }
+
+_stats_path: str = ""
+_last_stats_save: float = 0.0
+
+
+def set_stats_path(path: str) -> None:
+    """Задаёт файл для хранения статистики и загружает её."""
+    global _stats_path
+    _stats_path = path
+    if not path or not os.path.exists(path):
+        return
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in _stats:
+            if isinstance(data.get(k), (int, float)):
+                _stats[k] = data[k]
+    except Exception as e:
+        log.warning("stats_load_error", error=str(e))
+
+
+def _save_stats(force: bool = False) -> None:
+    """Сохраняет статистику на диск (не чаще раза в 2 секунды)."""
+    global _last_stats_save
+    if not _stats_path:
+        return
+    now = time.time()
+    if not force and now - _last_stats_save < 2:
+        return
+    _last_stats_save = now
+    try:
+        import json
+        os.makedirs(os.path.dirname(_stats_path), exist_ok=True)
+        tmp = _stats_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_stats, f, ensure_ascii=False)
+        os.replace(tmp, _stats_path)
+    except Exception as e:
+        log.warning("stats_save_error", error=str(e))
+
+
+def _bump(**deltas) -> None:
+    """Увеличивает глобальные счётчики и сохраняет статистику."""
+    for k, v in deltas.items():
+        if k in _stats:
+            _stats[k] += v
+    _save_stats()
 
 
 def get_stats() -> dict:
@@ -196,7 +245,7 @@ async def process_playlist(
 
 def _status_keyboard(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}")
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}", style="primary")
     ]])
 
 
@@ -228,24 +277,49 @@ def _render_status(status: TaskStatus, final: bool = False) -> str:
 
 
 async def _edit_status(bot: Bot, status: TaskStatus, final: bool = False, force: bool = False) -> None:
-    """Редактирует живое сообщение статуса (с троттлингом)."""
+    """Редактирует живое сообщение статуса (rich, с троттлингом)."""
     if not status.status_message_id or not status.status_chat_id:
         return
     now = time.time()
     if not force and now - status.last_edit < 2.0:
         return
     status.last_edit = now
-    try:
-        await bot.edit_message_text(
-            _render_status(status, final=final),
-            chat_id=status.status_chat_id,
-            message_id=status.status_message_id,
-            parse_mode="HTML",
-            reply_markup=None if final else _status_keyboard(status.task_id),
-        )
-    except Exception:
-        # "message is not modified" и прочее — игнорируем
-        pass
+    await edit_rich(
+        bot,
+        status.status_chat_id,
+        status.status_message_id,
+        _render_status_md(status, final=final),
+        reply_markup=None if final else _status_keyboard(status.task_id),
+        fallback=_render_status(status, final=final),
+    )
+
+
+def _render_status_md(status: TaskStatus, final: bool = False) -> str:
+    """Живой статус в rich-markdown."""
+    if final:
+        head = "# ⏹️ Задача отменена" if status.cancelled else "# 🏁 Плейлист обработан"
+    else:
+        head = "# ⏳ Обработка плейлиста"
+
+    lines = [head]
+    if status.playlist_name:
+        lines.append(f"🎧 **{status.playlist_name}**")
+    lines.append("")
+    lines.append(progress_bar(status.processed, status.total))
+    lines.append(f"**{status.processed}**/{status.total}")
+    if not final and status.current_track:
+        lines.append(f"🎵 {status.current_track[:50]}")
+    lines.append(f"✅ {status.sent}   ⚡ {status.cached}   ❌ {status.not_found}   ⚠️ {status.errors}")
+    if final:
+        lines.append(f"⏱ Время: {int(time.time() - status.started_at)} сек")
+    lines.append("")
+    lines.append(f"ID: `{status.task_id}`" + ("" if final else "   ·   /cancel"))
+    if final and status.failed_tracks:
+        lines.append("")
+        lines.append("**❌ Не найдены:**")
+        for ft in status.failed_tracks[:20]:
+            lines.append(f"- {ft}")
+    return "\n".join(lines)
 
 
 def _track_label(track: Track) -> str:
@@ -292,30 +366,28 @@ async def _process_tracks(
         # Живое статус-сообщение (само обновляется)
         try:
             status.status_chat_id = status.user_id
-            msg = await bot.send_message(
-                status.user_id, _render_status(status),
-                parse_mode="HTML", reply_markup=_status_keyboard(status.task_id),
+            msg = await send_rich(
+                bot, status.user_id, _render_status_md(status),
+                reply_markup=_status_keyboard(status.task_id),
+                fallback=_render_status(status),
             )
-            status.status_message_id = msg.message_id
-            status.last_edit = time.time()
-        except Exception as e:
-            log.error("status_message_send_error", error=str(e))
-            try:
-                msg = await bot.send_message(status.user_id, "⏳ Обработка плейлиста...")
+            if msg:
                 status.status_message_id = msg.message_id
                 status.last_edit = time.time()
-            except Exception:
-                pass
+        except Exception as e:
+            log.error("status_message_send_error", error=str(e))
 
         if playlist_name or total_duration:
             duration_str = format_duration(total_duration) if total_duration else "?"
-            header = (
-                f"🎧 <b>{playlist_name or 'Плейлист'}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎵 Треков: <b>{len(tracks)}</b>   ⏱ ~{duration_str}"
-            )
             try:
-                await bot.send_message(status.channel_id, header, parse_mode="HTML")
+                await send_rich(
+                    bot, status.channel_id,
+                    f"# 🎧 {playlist_name or 'Плейлист'}\n\n🎵 Треков: **{len(tracks)}**   ⏱ ~{duration_str}",
+                    fallback=(
+                        f"🎧 <b>{playlist_name or 'Плейлист'}</b>\n"
+                        f"🎵 Треков: <b>{len(tracks)}</b>   ⏱ ~{duration_str}"
+                    ),
+                )
             except Exception as e:
                 log.warning("playlist_header_send_error", error=str(e))
 
@@ -374,19 +446,18 @@ async def _process_tracks(
         elapsed = int(time.time() - status.started_at)
 
         if not status.cancelled:
-            _stats["total_playlists"] += 1
-            _stats["total_tracks"] += status.total
-            _stats["total_sent"] += status.sent
-            _stats["total_cached"] += status.cached
-            _stats["total_not_found"] += status.not_found
-            _stats["total_time"] += elapsed
+            _bump(total_playlists=1, total_time=elapsed)
+        _save_stats(force=True)
 
         # Финализируем то же сообщение
         if status.status_message_id:
             await _edit_status(bot, status, final=True, force=True)
         else:
             try:
-                await bot.send_message(status.user_id, _render_status(status, final=True), parse_mode="HTML")
+                await send_rich(
+                    bot, status.user_id, _render_status_md(status, final=True),
+                    fallback=_render_status(status, final=True),
+                )
             except Exception as e:
                 log.error("report_send_error", error=str(e))
 
@@ -565,6 +636,7 @@ async def _download_and_send(
         "file_size": os.path.getsize(final_mp3),
         "downloaded_at": int(time.time()),
     })
+    _bump(total_sent=1)
     return {"artist": disp_artist, "title": disp_title, "source": cand.source}
 
 
@@ -611,10 +683,14 @@ async def process_picked_candidate(
     """Скачивает и отправляет выбранного пользователем кандидата (из пикера)."""
     sender = TelegramSender(bot)
     hash_key = generate_hash(f"pick:{query}".lower(), cand.url)
-    return await _download_and_send(
+    _bump(total_tracks=1)
+    info = await _download_and_send(
         cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key, "", 0, "", "", query,
         vk_cover_url,
     )
+    if not info:
+        _bump(total_not_found=1)
+    return info
 
 
 async def _download_vk_and_send(
@@ -656,6 +732,7 @@ async def _download_vk_and_send(
         "file_size": os.path.getsize(final_mp3),
         "downloaded_at": int(time.time()),
     })
+    _bump(total_sent=1)
     return {"artist": disp_artist, "title": disp_title, "source": "vk"}
 
 
@@ -670,6 +747,7 @@ async def _process_single_track(
 ) -> str:
     hash_key = generate_hash(track.artist or track.query or "", track.title)
     vk_available = track.source == "vk" and bool(track.url)
+    _bump(total_tracks=1)
 
     # --- кэш ---
     cached = cache_mgr.get(hash_key)
@@ -688,6 +766,7 @@ async def _process_single_track(
                 if res.get("cover_file_id") and not cached.get("cover_file_id"):
                     cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
                 cache_mgr.update_access(hash_key)
+                _bump(total_sent=1, total_cached=1)
                 return "sent_cached_file_id"
             except Exception:
                 pass
@@ -697,6 +776,7 @@ async def _process_single_track(
                 cache_mgr.save_file_id(hash_key, res["file_id"])
             if res.get("cover_file_id"):
                 cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
+            _bump(total_sent=1, total_cached=1)
             return "sent_cached_file"
 
     # --- VK: режим «Всё из VK» ---
@@ -751,6 +831,7 @@ async def _process_single_track(
                 return "sent_new"
 
         log.info("track_not_found", artist=track.artist, title=track.title, query=query)
+        _bump(total_not_found=1)
         return "not_found"
 
     except Exception as e:

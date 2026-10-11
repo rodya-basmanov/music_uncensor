@@ -33,6 +33,7 @@ from utils.helpers import (
     clean_title_for_search,
 )
 from utils.logger import get_logger
+from utils.rich import edit_rich
 from utils.storage import UserStorage
 from utils.ui import source_icon, fmt_duration_mmss
 from utils.links import find_youtube_link
@@ -295,6 +296,20 @@ def _picker_text(data: dict, page: int) -> str:
     )
 
 
+def _picker_md(data: dict, page: int) -> str:
+    filt = data.get("filter", "all")
+    idxs = data["filters"].get(filt, [])
+    total_pages = max(1, (len(idxs) + _PICK_PAGE_SIZE - 1) // _PICK_PAGE_SIZE)
+    title = data.get("title") or f"🔍 **{data['query']}**"
+    return (
+        f"# 🎧 Результаты\n\n"
+        f"{title}\n\n"
+        f"Найдено: **{len(idxs)}**  ·  фильтр: {_FILTER_LABEL.get(filt, filt)}\n\n"
+        f"Страница **{page + 1}**/{total_pages}\n\n"
+        f"Выбери трек 👇"
+    )
+
+
 def _picker_keyboard(token: str, data: dict, page: int) -> InlineKeyboardMarkup:
     filt = data.get("filter", "all")
     idxs = data["filters"].get(filt, [])
@@ -338,23 +353,21 @@ def _picker_keyboard(token: str, data: dict, page: int) -> InlineKeyboardMarkup:
     # режим «выбирать каждый»
     if data.get("pk_session") is not None:
         rows.append([
-            InlineKeyboardButton(text="✅ Авто из VK", callback_data=f"pk_auto|{token}"),
+            InlineKeyboardButton(text="✅ Авто из VK", callback_data=f"pk_auto|{token}", style="success"),
             InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pk_skip|{token}"),
         ])
 
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"pickcancel|{token}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"pickcancel|{token}", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _render_picker(message: Message, token: str, data: dict, page: int) -> None:
-    try:
-        await message.edit_text(
-            _picker_text(data, page),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_picker_keyboard(token, data, page),
-        )
-    except Exception:
-        pass
+    await edit_rich(
+        message.bot, message.chat.id, message.message_id,
+        _picker_md(data, page),
+        reply_markup=_picker_keyboard(token, data, page),
+        fallback=_picker_text(data, page),
+    )
 
 
 async def _show_picker(message: Message, query: str, channel_id: int, user_id: int | None = None) -> None:
@@ -637,7 +650,7 @@ async def _handle_vk_link(message: Message, text: str, playlist_name: str | None
         "created": time.time(),
     }
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Искать оригиналы (uncensored)", callback_data=f"vkmode|{token}|uncensored")],
+        [InlineKeyboardButton(text="🔍 Искать оригиналы (uncensored)", callback_data=f"vkmode|{token}|uncensored", style="primary")],
         [InlineKeyboardButton(text="⬇️ Всё из VK", callback_data=f"vkmode|{token}|vk")],
         [InlineKeyboardButton(text="🎛 Выбирать каждый", callback_data=f"vkmode|{token}|pick")],
     ])
@@ -833,12 +846,12 @@ async def cb_pick(callback: CallbackQuery):
         next_label = f"➡️ Далее ({done + 1}/{total})" if done < total else "✅ Завершить"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🔁 Другой", callback_data=f"redo|{token}"),
-            InlineKeyboardButton(text=next_label, callback_data=f"next_track|{token}"),
+            InlineKeyboardButton(text=next_label, callback_data=f"next_track|{token}", style="primary"),
         ]])
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🔁 Другой вариант", callback_data=f"redo|{token}"),
-            InlineKeyboardButton(text="✅ Готово", callback_data=f"pickclose|{token}"),
+            InlineKeyboardButton(text="✅ Готово", callback_data=f"pickclose|{token}", style="success"),
         ]])
 
     try:

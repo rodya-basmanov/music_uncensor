@@ -47,7 +47,7 @@ async def cmd_status(message: Message):
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}", style="primary")],
     ])
 
     if status.done:
@@ -57,7 +57,7 @@ async def cmd_status(message: Message):
         state = "В процессе"
         state_emoji = "⏳"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}", style="primary")],
         ])
 
     progress_bar = _format_progress_bar(status.processed, status.total)
@@ -98,7 +98,7 @@ async def refresh_status(callback: CallbackQuery):
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}", style="primary")],
     ])
 
     if status.done:

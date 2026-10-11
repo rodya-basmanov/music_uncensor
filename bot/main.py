@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
+from aiogram.types import BotCommand
 from python_socks import ProxyError
 
 from bot.handlers import start, link, playlist, status, cancel, stats
@@ -86,6 +87,7 @@ async def main():
     start.set_storage(storage)
     link.set_storage(storage)
     processor.set_vk_token(config.vk_token)
+    processor.set_stats_path(os.path.join(config.data_dir, "stats.json"))
     tg_sender.set_send_interval(config.send_interval)
     playlist.set_dependencies(
         cache_mgr=cache_mgr, storage=storage,
@@ -93,6 +95,21 @@ async def main():
         source_order=config.source_order, ytdlp_proxy=config.ytdlp_proxy, vk_token=config.vk_token,
         vk_playlist_mode=config.vk_playlist_mode, concurrency=config.concurrency,
     )
+
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Меню"),
+            BotCommand(command="help", description="Справка"),
+            BotCommand(command="link", description="Привязать канал"),
+            BotCommand(command="channels", description="Мои каналы"),
+            BotCommand(command="unlink", description="Отвязать канал"),
+            BotCommand(command="status", description="Статус задачи"),
+            BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="cancel", description="Отменить задачу"),
+        ])
+        _log.info("commands_registered")
+    except Exception as e:
+        _log.warning("set_my_commands_failed", error=str(e))
 
     dp.include_router(start.router)
     dp.include_router(link.router)

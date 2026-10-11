@@ -3,9 +3,9 @@
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.enums import ParseMode
 
 from services.processor import get_stats
+from utils.rich import send_rich
 
 router = Router()
 
@@ -31,7 +31,20 @@ async def cmd_stats(message: Message):
     if stats["total_sent"] > 0:
         cache_rate = int(stats["total_cached"] / stats["total_sent"] * 100)
 
-    text = (
+    md = (
+        "# 📊 Статистика\n\n"
+        "## 🎵 Обработано\n"
+        f"- Плейлистов: **{stats['total_playlists']}**\n"
+        f"- Треков: **{stats['total_tracks']}**\n\n"
+        "## 📤 Отправлено\n"
+        f"- Всего: **{stats['total_sent']}**\n"
+        f"- Из кэша: {stats['total_cached']} ({cache_rate}%)\n"
+        f"- Не найдено: {stats['total_not_found']}\n\n"
+        "## ⏱ Общее время\n"
+        f"{_format_time(stats['total_time'])}"
+    )
+
+    html = (
         "📊 <b>Статистика бота</b>\n\n"
         f"🎵 <b>Обработано:</b>\n"
         f"   Плейлистов: {stats['total_playlists']}\n"
@@ -44,4 +57,4 @@ async def cmd_stats(message: Message):
         f"   {_format_time(stats['total_time'])}"
     )
 
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await send_rich(message.bot, message.chat.id, md, fallback=html)
