@@ -7,6 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python)
 ![aiogram](https://img.shields.io/badge/aiogram-3.x-purple)
 ![License](https://img.shields.io/badge/License-MIT-green)
+![CI](https://github.com/rodya-basmanov/music_uncensor/actions/workflows/ci.yml/badge.svg)
 
 ## 💡 Зачем это нужно
 
@@ -213,6 +214,17 @@ vk_music/
 | FloodWait при отправке | Увеличьте `SEND_INTERVAL` |
 | Нужен плейлист из Яндекс.Музыки/Spotify | Перенесите его в ВК приложением <https://vk.ru/app8116845> и пришлите VK-ссылку |
 | Треки не находятся | Попробуйте свободный запрос/пикер с вкладками источников |
+
+## 🧪 Тесты
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Юнит-тесты (без сети) покрывают: парсинг строк плейлиста и ссылок (ВК/YouTube),
+очистку названий, ранжирование кандидатов, хранилище привязок и кэш.
+CI (GitHub Actions) прогоняет их на Python 3.11 и 3.12 при каждом push/PR.
 
 ## 🗺 To do
 
