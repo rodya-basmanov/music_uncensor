@@ -90,7 +90,7 @@ class UserStorage:
         uid = str(user_id)
         if uid in data:
             default = data[uid].get("default_channel")
-            if default:
+            if default is not None:
                 return default
             channels = data[uid].get("channels", [])
             if channels:

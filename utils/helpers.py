@@ -1,25 +1,33 @@
 """Вспомогательные утилиты."""
 
 import hashlib
-import random
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 
 @dataclass
 class Track:
-    """Трек из VK плейлиста."""
+    """Трек из VK плейлиста или свободный поисковый запрос."""
     artist: str
     title: str
     duration: int = 0
+    query: str | None = None  # если задан — искать по этой строке как есть
+    url: str = ""             # прямая ссылка на mp3 (VK)
+    cover_url: str = ""       # прямая ссылка на обложку (VK)
+    source: str = ""          # "vk" — трек получен из VK (качаем напрямую)
 
 
 def parse_track_line(line: str) -> Optional[Track]:
     """
-    Парсит строку вида 'Artist - Title [duration_sec]'.
-    Формат script.js: Artist - Title [123].
-    Duration опционально.
+    Парсит строку плейлиста.
+
+    Поддерживает форматы:
+      "Artist - Title [123]"  → artist/title
+      "Artist – Title"        → artist/title (en-dash тоже)
+      "любой свободный текст" → Track.query (поиск как есть, напр. мешап)
+
+    Duration в конце "[123]" опциональна.
     """
     line = line.strip()
     if not line or line.startswith("#"):
@@ -32,36 +40,24 @@ def parse_track_line(line: str) -> Optional[Track]:
         duration = int(duration_match.group(1))
         line = line[:duration_match.start()].strip()
 
-    # Пробуем разделить по первому ' - '
-    parts = line.split(" - ", 1)
+    if not line:
+        return None
+
+    # Разделяем по первому тире (обычный дефис или en/em dash в окружении пробелов)
+    parts = re.split(r"\s+[-–—]\s+", line, maxsplit=1)
     if len(parts) == 2:
         artist, title = parts[0].strip(), parts[1].strip()
         if artist and title:
             return Track(artist=artist, title=title, duration=duration)
-    return None
 
-
-# Пул User-Agent для ротации
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-]
+    # Нет разделителя — свободный поисковый запрос
+    return Track(artist="", title=line, duration=duration, query=line)
 
 
 def generate_hash(artist: str, title: str) -> str:
     """Генерирует SHA256-хеш по artist + title (нижний регистр)."""
     key = f"{artist.strip().lower()}{title.strip().lower()}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-
-def random_ua() -> str:
-    """Возвращает случайный User-Agent."""
-    return random.choice(USER_AGENTS)
-
 
 
 def clean_artist_for_search(artist: str) -> str:
@@ -90,5 +86,27 @@ def clean_title_for_search(title: str) -> str:
     cleaned = re.sub(r"\s*(?:feat\.?|ft\.?|featuring)\s+.+$", "", cleaned, flags=re.IGNORECASE)
     # Убираем prod./produced by и всё после (в названии)
     cleaned = re.sub(r"\s*(?:prod\.?|produced by)\s+.+$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def format_duration(seconds: int) -> str:
+    """Форматирует секунды в читаемый вид: 5ч 30мин."""
+    if seconds < 60:
+        return f"{seconds} сек"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours}ч {minutes}мин"
+    return f"{minutes}мин"
+
+
+def clean_title_for_display(title: str) -> str:
+    """Очищает название для отображения: убирает только prod., feat., оставляет remix/slowed."""
+    if not title:
+        return ""
+    cleaned = title
+    cleaned = re.sub(r"\s*\([^)]*(?:prod\.?|produced by)[^)]*\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.+$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+(?:prod\.?|produced by)\s+.+$", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 

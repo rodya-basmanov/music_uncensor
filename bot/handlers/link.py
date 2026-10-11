@@ -97,13 +97,12 @@ async def cmd_channels(message: Message):
         )
         return
 
-    lines = ["📋 <b>Ваши каналы:</b>\n"]
+    lines = ["📡 <b>Ваши каналы</b>\n━━━━━━━━━━━━━━━━━━━━"]
     default = _storage.get_default_channel(user_id)
     for ch_id in channels:
-        marker = " ⭐" if ch_id == default else ""
-        lines.append(f"  • <code>{ch_id}</code>{marker}")
-    lines.append("\nСменить канал по умолчанию: /link <code>&lt;chat_id&gt;</code>")
-    lines.append("Для отвязки: /unlink <code>&lt;chat_id&gt;</code>")
+        marker = "  ⭐ <i>по умолчанию</i>" if ch_id == default else ""
+        lines.append(f"• <code>{ch_id}</code>{marker}")
+    lines.append("\n🔗 /link <code>-100XXX</code> — сменить\n🗑 /unlink <code>-100XXX</code> — отвязать")
 
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 

@@ -3,35 +3,76 @@
 import asyncio
 import os
 import random
+import re
+import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.cache_manager import CacheManager
-from core.downloader import Downloader
-from core.matcher import match_track
-from tinytag import TinyTag
-from core.scraper.mp3party import Mp3PartyScraper
-from core.scraper.soundcloud import search_and_download as sc_search_download
+from core.cover import download_image
+from core.scraper import soundcloud, youtube
+from core.scraper.common import (
+    DownloadResult,
+    Candidate,
+    download_audio,
+    rank_candidates,
+    score_candidate,
+    split_artist_title,
+)
 from services.tg_sender import TelegramSender
-from utils.helpers import Track, generate_hash, clean_artist_for_search, clean_title_for_search
+from utils.helpers import (
+    Track,
+    generate_hash,
+    clean_artist_for_search,
+    clean_title_for_search,
+    clean_title_for_display,
+    format_duration,
+)
+from utils.ffmpeg import make_thumbnail
 from utils.logger import get_logger
+from utils.ui import progress_bar, is_mashup, source_icon
 
 log = get_logger("processor")
 
+PROVIDERS = {
+    "youtube": youtube.search,
+    "soundcloud": soundcloud.search,
+}
 
-def _format_duration(seconds: int) -> str:
-    """Форматирует секунды в читаемый вид: 5ч 30мин."""
-    if seconds < 60:
-        return f"{seconds} сек"
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    if hours > 0:
-        return f"{hours}ч {minutes}мин"
-    return f"{minutes}мин"
+# Минимальный скор кандидата для структурных треков (с артистом)
+MIN_MATCH_SCORE = 55
+
+# VK API клиент (регистрируется, если задан VK_TOKEN)
+_vk_fetcher = None
+
+
+def set_vk_token(token: str) -> None:
+    """Регистрирует VK-клиент для поиска/загрузки (вызывается при инициализации)."""
+    global _vk_fetcher
+    if token:
+        from core.vk_fetcher import VKFetcher
+        _vk_fetcher = VKFetcher(token)
+    else:
+        _vk_fetcher = None
+
+
+def _vk_search(query: str, count: int = 5, proxy: str = "") -> list:
+    if not _vk_fetcher:
+        return []
+    return _vk_fetcher.search(query, count)
+
+
+def _provider(name: str):
+    """Возвращает функцию поиска по имени источника."""
+    if name == "vk":
+        return _vk_search
+    return PROVIDERS.get(name)
 
 
 @dataclass
@@ -50,6 +91,12 @@ class TaskStatus:
     done: bool = False
     cancelled: bool = False
     started_at: float = 0.0
+    status_message_id: int = 0
+    status_chat_id: int = 0
+    current_track: str = ""
+    last_edit: float = 0.0
+    playlist_name: str | None = None
+    total_duration: int = 0
 
 
 # Глобальное хранилище задач (в MVP — в памяти)
@@ -59,12 +106,12 @@ _active_users: set = set()
 
 # Статистика (глобальная)
 _stats = {
-    "total_playlists": 0,  # Всего плейлистов обработано
-    "total_tracks": 0,     # Всего треков обработано
-    "total_sent": 0,       # Всего отправлено в каналы
-    "total_cached": 0,     # Всего из кэша
-    "total_not_found": 0,  # Всего не найдено
-    "total_time": 0,       # Общее время в секундах
+    "total_playlists": 0,
+    "total_tracks": 0,
+    "total_sent": 0,
+    "total_cached": 0,
+    "total_not_found": 0,
+    "total_time": 0,
 }
 
 
@@ -78,6 +125,18 @@ def get_task_status(task_id: str) -> Optional[TaskStatus]:
     return _tasks.get(task_id)
 
 
+def cleanup_old_tasks(max_age_minutes: int = 30) -> int:
+    """Очищает старые завершённые задачи из памяти."""
+    global _tasks
+    now = time.time()
+    cutoff = now - (max_age_minutes * 60)
+    to_delete = [tid for tid, status in _tasks.items()
+                 if status.done and status.started_at < cutoff]
+    for tid in to_delete:
+        del _tasks[tid]
+    return len(to_delete)
+
+
 def is_user_busy(user_id: int) -> bool:
     """Проверяет, есть ли у пользователя активная задача."""
     return user_id in _active_users
@@ -88,11 +147,10 @@ def cancel_user_task(user_id: int) -> str | None:
     if user_id not in _active_users:
         return None
 
-    # Ищем задачу пользователя
     for task_id, status in _tasks.items():
         if status.user_id == user_id and not status.done:
             status.done = True
-            status.cancelled = True  # Добавляем флаг отмены
+            status.cancelled = True
             _active_users.discard(user_id)
             log.info("task_cancelled", task_id=task_id, user_id=user_id)
             return task_id
@@ -107,21 +165,12 @@ async def process_playlist(
     total_duration: int = 0,
     bot: Bot = None,
     cache_mgr: CacheManager = None,
-    scraper: Mp3PartyScraper = None,
-    downloader: Downloader = None,
-    fuzzy_threshold: int = 85,
     rate_limit: float = 2.0,
+    source_order: List[str] | None = None,
+    ytdlp_proxy: str = "",
+    mode: str = "uncensored",
+    concurrency: int = 3,
 ) -> str:
-    """
-    Запускает обработку плейлиста как фоновую задачу.
-
-    Args:
-        playlist_name: Название плейлиста (опционально)
-        total_duration: Общая длительность в секундах
-
-    Returns:
-        task_id
-    """
     task_id = str(uuid.uuid4())[:8]
     status = TaskStatus(
         task_id=task_id,
@@ -133,12 +182,91 @@ async def process_playlist(
     _tasks[task_id] = status
     _active_users.add(user_id)
 
-    # Запускаем обработку в фоне
-    asyncio.create_task(
-        _process_tracks(status, tracks, bot, cache_mgr, scraper, downloader, fuzzy_threshold, rate_limit, playlist_name, total_duration)
+    task = asyncio.create_task(
+        _process_tracks(
+            status, tracks, bot, cache_mgr, rate_limit,
+            playlist_name, total_duration, source_order or ["youtube", "soundcloud"], ytdlp_proxy, mode,
+            concurrency,
+        )
     )
+    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     return task_id
+
+
+def _status_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}")
+    ]])
+
+
+def _render_status(status: TaskStatus, final: bool = False) -> str:
+    """Единый текст живой статус-записи."""
+    if final:
+        head = "⏹️ <b>Задача отменена</b>" if status.cancelled else "🏁 <b>Плейлист обработан</b>"
+    else:
+        head = "⏳ <b>Обработка плейлиста</b>"
+
+    lines = [head]
+    if status.playlist_name:
+        lines.append(f"🎧 {status.playlist_name}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(progress_bar(status.processed, status.total))
+    lines.append(f"📊 <b>{status.processed}</b>/{status.total}")
+    if not final and status.current_track:
+        lines.append(f"🎵 {status.current_track[:50]}")
+    lines.append(f"✅ {status.sent}   ⚡ {status.cached}   ❌ {status.not_found}   ⚠️ {status.errors}")
+    if final:
+        lines.append(f"⏱ Время: {int(time.time() - status.started_at)} сек")
+    lines.append("")
+    lines.append(f"ID: <code>{status.task_id}</code>" + ("" if final else "   ·   /cancel"))
+    if final and status.failed_tracks:
+        lines.append("\n❌ <b>Не найдены:</b>")
+        for ft in status.failed_tracks[:20]:
+            lines.append(f"  • {ft}")
+    return "\n".join(lines)
+
+
+async def _edit_status(bot: Bot, status: TaskStatus, final: bool = False, force: bool = False) -> None:
+    """Редактирует живое сообщение статуса (с троттлингом)."""
+    if not status.status_message_id or not status.status_chat_id:
+        return
+    now = time.time()
+    if not force and now - status.last_edit < 2.0:
+        return
+    status.last_edit = now
+    try:
+        await bot.edit_message_text(
+            _render_status(status, final=final),
+            chat_id=status.status_chat_id,
+            message_id=status.status_message_id,
+            parse_mode="HTML",
+            reply_markup=None if final else _status_keyboard(status.task_id),
+        )
+    except Exception:
+        # "message is not modified" и прочее — игнорируем
+        pass
+
+
+def _track_label(track: Track) -> str:
+    if track.artist or track.title:
+        return f"{track.artist} - {track.title}".strip(" -")
+    return track.query or ""
+
+
+def _apply_result(status: TaskStatus, track: Track, result: str) -> None:
+    """Обновляет счётчики/список по результату обработки трека."""
+    if result in ("sent_cached_file_id", "sent_cached_file"):
+        status.sent += 1
+        status.cached += 1
+    elif result == "sent_new":
+        status.sent += 1
+    elif result == "not_found":
+        status.not_found += 1
+        status.failed_tracks.append(_track_label(track))
+    else:
+        status.errors += 1
+        status.failed_tracks.append(f"{_track_label(track)} (ошибка)")
 
 
 async def _process_tracks(
@@ -146,102 +274,105 @@ async def _process_tracks(
     tracks: List[Track],
     bot: Bot,
     cache_mgr: CacheManager,
-    scraper: Mp3PartyScraper,
-    downloader: Downloader,
-    fuzzy_threshold: int,
     rate_limit: float,
     playlist_name: str | None = None,
     total_duration: int = 0,
+    source_order: List[str] | None = None,
+    ytdlp_proxy: str = "",
+    mode: str = "uncensored",
+    concurrency: int = 1,
 ) -> None:
-    """Внутренний цикл обработки треков."""
+    """Внутренний цикл обработки треков (последовательно или пулом воркеров)."""
     sender = TelegramSender(bot)
+    source_order = source_order or ["youtube", "soundcloud"]
+    status.playlist_name = playlist_name
+    status.total_duration = total_duration
 
     try:
-        # Отправляем заголовок плейлиста в канал
+        # Живое статус-сообщение (само обновляется)
+        try:
+            status.status_chat_id = status.user_id
+            msg = await bot.send_message(
+                status.user_id, _render_status(status),
+                parse_mode="HTML", reply_markup=_status_keyboard(status.task_id),
+            )
+            status.status_message_id = msg.message_id
+            status.last_edit = time.time()
+        except Exception as e:
+            log.error("status_message_send_error", error=str(e))
+            try:
+                msg = await bot.send_message(status.user_id, "⏳ Обработка плейлиста...")
+                status.status_message_id = msg.message_id
+                status.last_edit = time.time()
+            except Exception:
+                pass
+
         if playlist_name or total_duration:
-            duration_str = _format_duration(total_duration) if total_duration else "?"
-            if playlist_name:
-                header = f"🎵 <b>{playlist_name}</b>\n📊 {len(tracks)} треков, ~{duration_str}"
-            else:
-                header = f"🎵 Плейлист\n📊 {len(tracks)} треков, ~{duration_str}"
+            duration_str = format_duration(total_duration) if total_duration else "?"
+            header = (
+                f"🎧 <b>{playlist_name or 'Плейлист'}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎵 Треков: <b>{len(tracks)}</b>   ⏱ ~{duration_str}"
+            )
             try:
                 await bot.send_message(status.channel_id, header, parse_mode="HTML")
             except Exception as e:
                 log.warning("playlist_header_send_error", error=str(e))
 
-        for i, track in enumerate(tracks):
-            # Проверяем не отменена ли задача
-            if status.cancelled:
-                log.info("task_stopped_by_user", task_id=status.task_id, processed=status.processed)
-                break
+        if concurrency <= 1 or len(tracks) <= 1:
+            for i, track in enumerate(tracks):
+                if status.cancelled:
+                    log.info("task_stopped_by_user", task_id=status.task_id, processed=status.processed)
+                    break
+                status.processed = i + 1
+                status.current_track = _track_label(track)
+                await _edit_status(bot, status)
 
-            status.processed = i + 1
-            result = await _process_single_track(
-                track, status.channel_id, cache_mgr, scraper,
-                downloader, sender, fuzzy_threshold,
-            )
+                result = await _process_single_track(
+                    track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
+                )
+                _apply_result(status, track, result)
+                await _edit_status(bot, status)
 
-            if result == "sent_cached_file_id":
-                status.sent += 1
-                status.cached += 1
-            elif result == "sent_cached_file":
-                status.sent += 1
-                status.cached += 1
-            elif result == "sent_new":
-                status.sent += 1
-            elif result == "not_found":
-                status.not_found += 1
-                status.failed_tracks.append(f"{track.artist} - {track.title}")
-            else:  # error
-                status.errors += 1
-                status.failed_tracks.append(f"{track.artist} - {track.title} (ошибка)")
+                if i < len(tracks) - 1 and mode != "vk":
+                    await asyncio.sleep(random.uniform(rate_limit, rate_limit + 2))
+        else:
+            lock = asyncio.Lock()
+            queue: asyncio.Queue = asyncio.Queue()
+            for t in tracks:
+                queue.put_nowait(t)
 
-            # Отправляем прогресс каждые 5 треков
-            if status.processed % 5 == 0 and status.processed < status.total:
-                try:
-                    await bot.send_message(
-                        status.user_id,
-                        f"⏳ Прогресс: {status.processed}/{status.total}\n"
-                        f"✅ Отправлено: {status.sent} | ⚡ Из кэша: {status.cached} | "
-                        f"❌ Не найдено: {status.not_found}",
-                    )
-                except Exception:
-                    pass
+            async def worker() -> None:
+                while not status.cancelled:
+                    try:
+                        track = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        result = await _process_single_track(
+                            track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
+                        )
+                    except Exception as e:
+                        log.error("track_worker_error", error=str(e), title=track.title)
+                        result = "error"
 
-            # Задержка между треками (анти-бан)
-            if i < len(tracks) - 1:
-                await asyncio.sleep(random.uniform(rate_limit, rate_limit + 2))
+                    async with lock:
+                        status.processed += 1
+                        status.current_track = _track_label(track)
+                        _apply_result(status, track, result)
+                        await _edit_status(bot, status)
 
-        # Финальный отчёт
+                    if mode != "vk":
+                        await asyncio.sleep(random.uniform(rate_limit, rate_limit + 2))
+
+            n = max(1, min(concurrency, len(tracks)))
+            workers = [asyncio.create_task(worker()) for _ in range(n)]
+            await asyncio.gather(*workers, return_exceptions=True)
+
         status.done = True
+        status.current_track = ""
         elapsed = int(time.time() - status.started_at)
 
-        # Проверяем была ли отмена
-        if status.cancelled:
-            report = (
-                f"⏹️ <b>Задача отменена пользователем</b>\n\n"
-                f"📊 Результат ({task_id_display(status.task_id)}):\n"
-                f"  ✅ Отправлено: {status.sent}/{status.total}\n"
-                f"  ⚡ Из кэша: {status.cached}\n"
-                f"  ⏱ Время: {elapsed} сек"
-            )
-        else:
-            report = (
-                f"🏁 Плейлист обработан!\n\n"
-                f"📊 Результат ({task_id_display(status.task_id)}):\n"
-                f"  ✅ Отправлено: {status.sent}/{status.total}\n"
-                f"  ⚡ Из кэша: {status.cached}\n"
-                f"  ❌ Не найдено: {status.not_found}\n"
-                f"  ⚠️ Ошибок: {status.errors}\n"
-                f"  ⏱ Время: {elapsed} сек"
-            )
-
-        if status.failed_tracks:
-            report += "\n\n❌ Не найдены:\n"
-            for ft in status.failed_tracks[:20]:
-                report += f"  • {ft}\n"
-
-        # Обновляем глобальную статистику
         if not status.cancelled:
             _stats["total_playlists"] += 1
             _stats["total_tracks"] += status.total
@@ -250,10 +381,14 @@ async def _process_tracks(
             _stats["total_not_found"] += status.not_found
             _stats["total_time"] += elapsed
 
-        try:
-            await bot.send_message(status.user_id, report, parse_mode="HTML")
-        except Exception as e:
-            log.error("report_send_error", error=str(e))
+        # Финализируем то же сообщение
+        if status.status_message_id:
+            await _edit_status(bot, status, final=True, force=True)
+        else:
+            try:
+                await bot.send_message(status.user_id, _render_status(status, final=True), parse_mode="HTML")
+            except Exception as e:
+                log.error("report_send_error", error=str(e))
 
     except Exception as e:
         log.error("playlist_processing_error", error=str(e), task_id=status.task_id)
@@ -267,204 +402,357 @@ async def _process_tracks(
             pass
     finally:
         _active_users.discard(status.user_id)
+        if len(_tasks) > 100:
+            cleanup_old_tasks()
+
+
+def _is_junk(s: str) -> bool:
+    s = (s or "").strip()
+    return (not s) or s.isdigit() or len(s) <= 1
+
+
+_SEP = re.compile(r"\s+[-–—]\s+")
+
+
+def _resolve_display(dr: DownloadResult, cand: Candidate, artist_hint: str) -> tuple[str, str]:
+    """Возвращает (artist, title) для метаданных Telegram.
+
+    Приоритет: структура заголовка "Artist - Title" > поля источника.
+    Отсекает мусорные uploader'ы вроде "5".
+    """
+    raw_title = (dr.title or cand.title or "").strip()
+    raw_artist = (dr.artist or cand.artist or "").strip()
+
+    if _SEP.search(raw_title):
+        a, t = split_artist_title(raw_title, "")
+        artist = a if not _is_junk(a) else (raw_artist or artist_hint or cand.uploader or "Unknown Artist")
+        title = t
+    else:
+        title = clean_title_for_display(raw_title)
+        if not _is_junk(raw_artist):
+            artist = raw_artist
+        elif not _is_junk(cand.uploader):
+            artist = cand.uploader
+        else:
+            artist = artist_hint or "Unknown Artist"
+
+    if not title.strip():
+        title = raw_title or cand.title or "Unknown"
+
+    return artist.strip(), title.strip()
+
+
+async def _download_vk_media(
+    media_url: str,
+    cover_url: str,
+    work_dir: str,
+    cache_mgr: CacheManager,
+    hash_key: str,
+    ytdlp_proxy: str,
+    artist: str = "",
+    title: str = "",
+) -> tuple[Optional[str], str]:
+    """Скачивает аудио из VK (mp3/HLS) + обложку. Возвращает (mp3_path, cover_path)."""
+    dr = await asyncio.to_thread(download_audio, media_url, work_dir, "audio", "", "vk", False)
+    if not dr or not dr.file_path:
+        return None, ""
+
+    final_mp3 = cache_mgr._file_path(hash_key)
+    if os.path.exists(final_mp3):
+        try:
+            os.remove(final_mp3)
+        except OSError:
+            pass
+    os.replace(dr.file_path, final_mp3)
+
+    cover_path = ""
+    final_cover = cache_mgr._cover_path(hash_key)
+    if cover_url:
+        raw = os.path.join(work_dir, "cover")
+        if await download_image(cover_url, raw, ""):
+            if make_thumbnail(raw, final_cover):
+                cover_path = final_cover
+    return final_mp3, cover_path
+
+
+async def _download_and_send(
+    cand: Candidate,
+    channel_id: int,
+    cache_mgr: CacheManager,
+    sender: TelegramSender,
+    ytdlp_proxy: str,
+    hash_key: str,
+    artist_hint: str = "",
+    duration_hint: int = 0,
+    original_artist: str = "",
+    original_title: str = "",
+    query: str = "",
+    vk_cover_url: str = "",
+) -> Optional[dict]:
+    """Скачивает конкретного кандидата и отправляет в канал.
+
+    Для source="vk" — прямая загрузка из VK; иначе yt-dlp (YouTube/SoundCloud).
+    Returns:
+        {"artist", "title", "source"} при успехе, иначе None.
+    """
+    work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
+    try:
+        if cand.source == "vk":
+            final_mp3, cover_path = await _download_vk_media(
+                cand.url, cand.cover_url, work_dir, cache_mgr, hash_key, ytdlp_proxy,
+                cand.artist, cand.title,
+            )
+            if not final_mp3:
+                return None
+            disp_artist = (cand.artist or artist_hint or "Unknown Artist").strip()
+            disp_title = (cand.title or "Unknown").strip()
+            duration = int(cand.duration) or duration_hint
+            source_url = cand.url
+        else:
+            dr = await asyncio.to_thread(
+                download_audio, cand.url, work_dir, "audio", ytdlp_proxy, cand.source,
+            )
+            if not dr or not dr.file_path:
+                return None
+
+            final_mp3 = cache_mgr._file_path(hash_key)
+            if os.path.exists(final_mp3):
+                try:
+                    os.remove(final_mp3)
+                except OSError:
+                    pass
+            os.replace(dr.file_path, final_mp3)
+
+            disp_artist, disp_title = _resolve_display(dr, cand, artist_hint)
+            duration = dr.duration or duration_hint
+            source_url = dr.source_url
+
+            cover_path = ""
+            final_cover = cache_mgr._cover_path(hash_key)
+            got_cover = False
+            cover_origin = "none"
+            # 1. Обложка из VK-плейлиста (приоритет)
+            if vk_cover_url:
+                raw_vk = os.path.join(work_dir, "cover_vk")
+                if await download_image(vk_cover_url, raw_vk, ""):
+                    if make_thumbnail(raw_vk, final_cover):
+                        cover_path = final_cover
+                        got_cover = True
+                        cover_origin = "vk"
+            # 2. Обложка самого источника (SoundCloud/YouTube)
+            if not got_cover and dr.cover_path:
+                if make_thumbnail(dr.cover_path, final_cover):
+                    cover_path = final_cover
+                    cover_origin = "source"
+            log.info("cover_resolved", track=disp_title[:40], origin=cover_origin)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    send_track = Track(artist=disp_artist, title=disp_title, duration=duration)
+    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None)
+
+    cache_mgr.save(hash_key, {
+        "artist": original_artist or query,
+        "title": original_title or query,
+        "display_artist": disp_artist,
+        "display_title": disp_title,
+        "file_path": final_mp3,
+        "cover_path": cover_path,
+        "telegram_file_id": res.get("file_id") or "",
+        "cover_file_id": res.get("cover_file_id") or "",
+        "source": cand.source,
+        "source_url": source_url,
+        "file_size": os.path.getsize(final_mp3),
+        "downloaded_at": int(time.time()),
+    })
+    return {"artist": disp_artist, "title": disp_title, "source": cand.source}
+
+
+async def search_all(
+    query: str,
+    source_order: List[str],
+    ytdlp_proxy: str = "",
+    per_source: int = 5,
+) -> List[Candidate]:
+    """Ищет во всех источниках и возвращает объединённый список кандидатов."""
+    results: List[Candidate] = []
+    for src in source_order:
+        searcher = _provider(src)
+        if not searcher:
+            continue
+        try:
+            cands = await asyncio.to_thread(searcher, query, per_source, ytdlp_proxy)
+        except Exception as e:
+            log.warning("search_error", source=src, query=query, error=str(e))
+            cands = []
+        for c in rank_candidates(cands, query, 0, "", limit=per_source):
+            results.append(c)
+    return results
+
+
+def _effective_order(source_order: List[str], is_query: bool) -> List[str]:
+    """Для свободного ввода/мешапов SoundCloud идёт первым (там оригиналы)."""
+    if not is_query:
+        return list(source_order)
+    ordered = ["soundcloud"] + [s for s in source_order if s != "soundcloud"]
+    return ordered
+
+
+async def process_picked_candidate(
+    user_id: int,
+    channel_id: int,
+    cand: Candidate,
+    bot: Bot,
+    cache_mgr: CacheManager,
+    ytdlp_proxy: str = "",
+    query: str = "",
+    vk_cover_url: str = "",
+) -> Optional[dict]:
+    """Скачивает и отправляет выбранного пользователем кандидата (из пикера)."""
+    sender = TelegramSender(bot)
+    hash_key = generate_hash(f"pick:{query}".lower(), cand.url)
+    return await _download_and_send(
+        cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key, "", 0, "", "", query,
+        vk_cover_url,
+    )
+
+
+async def _download_vk_and_send(
+    track: Track,
+    channel_id: int,
+    cache_mgr: CacheManager,
+    sender: TelegramSender,
+    hash_key: str,
+    ytdlp_proxy: str = "",
+) -> Optional[dict]:
+    """Скачивает трек напрямую из VK (точная версия + обложка)."""
+    work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
+    try:
+        final_mp3, cover_path = await _download_vk_media(
+            track.url, track.cover_url, work_dir, cache_mgr, hash_key, ytdlp_proxy,
+            track.artist, track.title,
+        )
+        if not final_mp3:
+            return None
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    disp_artist = track.artist.strip() or "Unknown Artist"
+    disp_title = track.title.strip() or "Unknown"
+    send_track = Track(artist=disp_artist, title=disp_title, duration=track.duration)
+
+    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None)
+    cache_mgr.save(hash_key, {
+        "artist": track.artist,
+        "title": track.title,
+        "display_artist": disp_artist,
+        "display_title": disp_title,
+        "file_path": final_mp3,
+        "cover_path": cover_path,
+        "telegram_file_id": res.get("file_id") or "",
+        "cover_file_id": res.get("cover_file_id") or "",
+        "source": "vk",
+        "source_url": track.url,
+        "file_size": os.path.getsize(final_mp3),
+        "downloaded_at": int(time.time()),
+    })
+    return {"artist": disp_artist, "title": disp_title, "source": "vk"}
 
 
 async def _process_single_track(
     track: Track,
     channel_id: int,
     cache_mgr: CacheManager,
-    scraper: Mp3PartyScraper,
-    downloader: Downloader,
     sender: TelegramSender,
-    fuzzy_threshold: int,
+    source_order: List[str],
+    ytdlp_proxy: str = "",
+    mode: str = "uncensored",
 ) -> str:
-    """
-    Обрабатывает один трек: кэш → поиск → download → send.
-    
-    Returns:
-        Статус: sent_cached_file_id, sent_cached_file, sent_new, not_found, error
-    """
-    hash_key = generate_hash(track.artist, track.title)
+    hash_key = generate_hash(track.artist or track.query or "", track.title)
+    vk_available = track.source == "vk" and bool(track.url)
+
+    # --- кэш ---
+    cached = cache_mgr.get(hash_key)
+    if cached:
+        file_id = cached.get("telegram_file_id")
+        file_path = cached.get("file_path", "")
+        cover = cached.get("cover_path") or ""
+        send_track = Track(
+            artist=cached.get("display_artist") or track.artist,
+            title=cached.get("display_title") or track.title,
+            duration=track.duration,
+        )
+        if file_id:
+            try:
+                res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover)
+                if res.get("cover_file_id") and not cached.get("cover_file_id"):
+                    cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
+                cache_mgr.update_access(hash_key)
+                return "sent_cached_file_id"
+            except Exception:
+                pass
+        if file_path and os.path.exists(file_path):
+            res = await sender.send_file(channel_id, file_path, send_track, cover=cover)
+            if res.get("file_id"):
+                cache_mgr.save_file_id(hash_key, res["file_id"])
+            if res.get("cover_file_id"):
+                cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
+            return "sent_cached_file"
+
+    # --- VK: режим «Всё из VK» ---
+    if mode == "vk" and vk_available:
+        info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy)
+        if info:
+            log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
+            return "sent_new"
+        log.warning("vk_direct_failed_fallback_search", artist=track.artist, title=track.title)
+
+    # --- поиск по источникам ---
+    if track.query:
+        query = track.query
+        artist_hint = ""
+    else:
+        artist_hint = clean_artist_for_search(track.artist)
+        query = f"{artist_hint} {clean_title_for_search(track.title)}".strip()
+
+    order = _effective_order(source_order, bool(track.query) or is_mashup(track.title) or is_mashup(track.artist))
 
     try:
-        # 1. Проверяем кэш
-        cached = cache_mgr.get(hash_key)
-        if cached:
-            file_id = cached.get("telegram_file_id")
-            file_path = cached.get("file_path", "")
+        for source_name in order:
+            searcher = _provider(source_name)
+            if not searcher:
+                continue
 
-            if file_id:
-                try:
-                    await sender.send_by_file_id(channel_id, file_id, track)
-                    cache_mgr.update_access(hash_key)
-                    return "sent_cached_file_id"
-                except Exception:
-                    # file_id может устареть — пробуем файл
-                    pass
+            candidates = await asyncio.to_thread(searcher, query, 5, ytdlp_proxy)
+            ranked = rank_candidates(candidates, query, track.duration, artist_hint, limit=3)
+            if not ranked:
+                continue
 
-            if file_path and os.path.exists(file_path):
-                new_file_id = await sender.send_file(channel_id, file_path, track)
-                if new_file_id:
-                    cache_mgr.save_file_id(hash_key, new_file_id)
-                return "sent_cached_file"
+            # Отсекаем заведомо слабые совпадения (структурные треки с артистом)
+            if artist_hint and score_candidate(ranked[0], query, track.duration, artist_hint) < MIN_MATCH_SCORE:
+                log.info("source_weak_match", source=source_name, query=query)
+                continue
 
-        # 2. Подготавливаем поисковые запросы (чистые — без feat./prod.)
-        search_artist = clean_artist_for_search(track.artist)
-        search_title = clean_title_for_search(track.title)
+            for cand in ranked:
+                info = await _download_and_send(
+                    cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key,
+                    artist_hint, track.duration, track.artist, track.title, query,
+                    track.cover_url,
+                )
+                if info:
+                    log.info("track_sent", source=info["source"], display=f"{info['artist']} - {info['title']}")
+                    return "sent_new"
 
-        # 3. Пробуем SoundCloud (основной источник)
-        sc_dir = os.path.join("./data/cache", "sc")
-        os.makedirs(sc_dir, exist_ok=True)
-        sc_path = await asyncio.to_thread(
-            sc_search_download, search_artist, search_title, sc_dir, track.duration
-        )
-        if sc_path:
-            # Переименовываем sc_tmp.mp3 в {hash}.mp3 чтобы не перезаписывать
-            final_sc_path = os.path.join(sc_dir, f"{hash_key}.mp3")
-            if sc_path != final_sc_path and os.path.exists(sc_path):
-                if os.path.exists(final_sc_path):
-                    os.remove(final_sc_path)
-                os.rename(sc_path, final_sc_path)
-                sc_path = final_sc_path
-            file_id = await sender.send_file(channel_id, sc_path, track)
-            cache_mgr.save(hash_key, {
-                "artist": track.artist,
-                "title": track.title,
-                "file_path": sc_path,
-                "telegram_file_id": file_id or "",
-                "source": "soundcloud",
-                "file_size": os.path.getsize(sc_path),
-                "downloaded_at": int(time.time()),
-            })
-            return "sent_new"
+        # Fallback: ничего не нашли в uncensored-источниках → отдаём версию из VK
+        if mode != "vk" and vk_available:
+            info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy)
+            if info:
+                log.info("track_sent_vk_fallback", display=f"{info['artist']} - {info['title']}")
+                return "sent_new"
 
-        # 4. SoundCloud не нашёл — fallback на mp3party
-        log.info("soundcloud_not_found_mp3party_fallback", artist=track.artist, title=track.title)
-        results = await scraper.search_async(search_artist, search_title)
-        best = None
-        candidates = []
-
-        if results:
-            candidates = [
-                {"artist": r.artist, "title": r.title, "mp3_url": r.mp3_url, "page_url": r.page_url}
-                for r in results
-            ]
-            best = match_track(search_artist, search_title, candidates, fuzzy_threshold)
-
-        if not best:
-            log.info("track_not_found_anywhere", artist=track.artist, title=track.title)
-            return "not_found"
-
-        # 4. Задержка между поиском и скачиванием
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-
-        # 5. Скачиваем: пробуем best match, затем fallback на других кандидатах
-        file_path = None
-        all_candidates = [best] + [c for c in candidates if c != best]
-        for candidate in all_candidates[:3]:  # Max 3 попытки
-            file_path = await downloader.download_async(
-                candidate["mp3_url"], hash_key, candidate.get("page_url", "")
-            )
-            if file_path:
-                best = candidate
-                break
-            log.info("download_candidate_failed", url=candidate["mp3_url"], trying_next=True)
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-
-        if not file_path:
-            log.warning("download_failed_all_candidates", artist=track.artist, title=track.title)
-            return "error"
-
-        # 5.5 Проверяем длительность если есть в VK
-        if track.duration > 0:
-            try:
-                tag = TinyTag.get(file_path)
-                if tag.duration:
-                    diff = abs(tag.duration - track.duration)
-                    if diff > 5:
-                        log.warning(
-                            "duration_mismatch",
-                            artist=track.artist,
-                            title=track.title,
-                            expected=track.duration,
-                            actual=round(tag.duration),
-                            diff=round(diff),
-                        )
-                        # Удаляем файл и пробуем следующего кандидата
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                        # Пробуем остальных кандидатов (все после best)
-                        remaining = all_candidates[1:]  # all_candidates[0] = best, остальные - candidates без best
-                        for candidate in remaining[:2]:
-                            file_path = await downloader.download_async(
-                                candidate["mp3_url"], hash_key, candidate.get("page_url", "")
-                            )
-                            if file_path:
-                                try:
-                                    tag2 = TinyTag.get(file_path)
-                                    if tag2.duration and abs(tag2.duration - track.duration) <= 5:
-                                        best = candidate
-                                        break
-                                except Exception:
-                                    break
-                            log.info("duration_retry_failed", url=candidate["mp3_url"])
-                            await asyncio.sleep(random.uniform(1.0, 2.0))
-                        else:
-                            file_path = None
-                        if not file_path:
-                            log.warning("duration_all_candidates_mismatch", artist=track.artist, title=track.title)
-                            # Пробуем SoundCloud как fallback
-                            sc_path = await asyncio.to_thread(
-                                sc_search_download, search_artist, search_title, sc_dir, track.duration
-                            )
-                            if sc_path:
-                                final_sc_path = os.path.join(sc_dir, f"{hash_key}.mp3")
-                                if sc_path != final_sc_path and os.path.exists(sc_path):
-                                    if os.path.exists(final_sc_path):
-                                        os.remove(final_sc_path)
-                                    os.rename(sc_path, final_sc_path)
-                                    sc_path = final_sc_path
-                                file_id = await sender.send_file(channel_id, sc_path, track)
-                                cache_mgr.save(hash_key, {
-                                    "artist": track.artist,
-                                    "title": track.title,
-                                    "file_path": sc_path,
-                                    "telegram_file_id": file_id or "",
-                                    "source": "soundcloud",
-                                    "file_size": os.path.getsize(sc_path),
-                                    "downloaded_at": int(time.time()),
-                                })
-                                return "sent_new"
-                            return "error"
-            except Exception as e:
-                log.warning("duration_check_error", error=str(e))
-
-        # 6. Отправляем
-        file_id = await sender.send_file(channel_id, file_path, track)
-
-        # 7. Сохраняем в кэш
-        cache_mgr.save(hash_key, {
-            "artist": track.artist,
-            "title": track.title,
-            "file_path": file_path,
-            "telegram_file_id": file_id or "",
-            "source_url": best.get("page_url", ""),
-            "file_size": os.path.getsize(file_path),
-            "downloaded_at": int(time.time()),
-        })
-
-        return "sent_new"
+        log.info("track_not_found", artist=track.artist, title=track.title, query=query)
+        return "not_found"
 
     except Exception as e:
-        log.error(
-            "track_processing_error",
-            artist=track.artist,
-            title=track.title,
-            error=str(e),
-        )
+        log.error("track_processing_error", artist=track.artist, title=track.title, error=str(e))
         return "error"
-
-
-def task_id_display(task_id: str) -> str:
-    """Форматирует task_id для отображения."""
-    return f"<code>{task_id}</code>"

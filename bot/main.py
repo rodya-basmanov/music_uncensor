@@ -5,7 +5,6 @@ import signal
 import sys
 import os
 
-# Добавляем корневую директорию в sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sentry_sdk
@@ -19,92 +18,56 @@ from python_socks import ProxyError
 
 from bot.handlers import start, link, playlist, status, cancel, stats
 from core.cache_manager import CacheManager
-from core.downloader import Downloader
-from core.scraper.mp3party import Mp3PartyScraper
+from services import processor, tg_sender
 from utils.config import load_config
 from utils.logger import setup_logging, get_logger
 from utils.storage import UserStorage
 
-# Глобальные переменные для graceful shutdown
 _shutdown_event: asyncio.Event | None = None
 _log = None
 
 
-async def _shutdown(sig_name: str, scraper: Mp3PartyScraper, cache_mgr: CacheManager, bot: Bot):
-    """Graceful shutdown — корректно закрывает все ресурсы."""
+async def _shutdown(sig_name: str, cache_mgr: CacheManager, bot: Bot):
     global _log
     if _log:
         _log.info("shutdown_initiated", signal=sig_name)
-
-    # Останавливаем приём новых событий
     if _shutdown_event:
         _shutdown_event.set()
-
-    # Очищаем кэш при выключении
     try:
-        deleted = cache_mgr.cleanup()
+        deleted = await cache_mgr.cleanup()
         if deleted and _log:
             _log.info("cache_cleanup_on_shutdown", deleted=deleted)
     except Exception as e:
         if _log:
             _log.error("cache_cleanup_error", error=str(e))
-
-    # Закрываем aiohttp сессию скрейпера
-    try:
-        await scraper.close()
-    except Exception as e:
-        if _log:
-            _log.error("scraper_close_error", error=str(e))
-
-    # Закрываем сессию бота
     try:
         await bot.session.close()
-    except Exception as e:
-        if _log:
-            _log.error("bot_session_close_error", error=str(e))
-
+    except Exception:
+        pass
     if _log:
         _log.info("shutdown_complete")
 
 
 async def main():
-    """Главная функция запуска бота."""
     global _shutdown_event, _log
 
-    # Загружаем конфиг
     config = load_config()
-
-    # Настраиваем логирование
     setup_logging(config.log_level)
     _log = get_logger("main")
 
-    # Инициализируем Sentry (если DSN указан)
     if config.sentry_dsn:
-        sentry_sdk.init(
-            dsn=config.sentry_dsn,
-            traces_sample_rate=0.1,
-            environment="production",
-        )
+        sentry_sdk.init(dsn=config.sentry_dsn, traces_sample_rate=0.1, environment="production")
         _log.info("sentry_enabled")
 
-    # Проверяем обязательные параметры
     if not config.bot_token:
         _log.error("BOT_TOKEN не задан в .env!")
         sys.exit(1)
 
     _log.info("starting_bot", log_level=config.log_level)
 
-    # Инициализируем компоненты
-    storage = UserStorage("./data/users.json")
-    cache_mgr = CacheManager(
-        cache_dir=config.cache_dir,
-        ttl_days=config.cache_ttl_days,
-        max_size_gb=config.max_cache_size_gb,
-    )
-    scraper = Mp3PartyScraper(rate_limit=config.rate_limit_search)
-    downloader = Downloader(cache_dir=config.cache_dir)
+    storage = UserStorage(os.path.join(config.data_dir, "users.json"))
+    cache_mgr = CacheManager(cache_dir=config.cache_dir, ttl_days=config.cache_ttl_days, max_size_gb=config.max_cache_size_gb)
 
-    # Создаём бота
     session = None
     if config.telegram_proxy_url:
         session = AiohttpSession(proxy=config.telegram_proxy_url)
@@ -112,8 +75,7 @@ async def main():
     bot = Bot(token=config.bot_token, session=session)
     dp = Dispatcher()
 
-    # Sentry error handler
-    @dp.errors()
+    @dp.error()
     async def sentry_error_handler(event):
         from aiogram.types import ErrorEvent
         if isinstance(event, ErrorEvent):
@@ -121,55 +83,45 @@ async def main():
             if _log:
                 _log.error("unhandled_exception", error=str(event.exception))
 
-    # Инжектим зависимости в хендлеры
-    link.set_storage(storage)
     start.set_storage(storage)
+    link.set_storage(storage)
+    processor.set_vk_token(config.vk_token)
+    tg_sender.set_send_interval(config.send_interval)
     playlist.set_dependencies(
-        scraper=scraper,
-        downloader=downloader,
-        cache_mgr=cache_mgr,
-        storage=storage,
-        fuzzy_threshold=config.fuzzy_threshold,
-        max_playlist_size=config.max_playlist_size,
-        rate_limit=config.rate_limit_search,
+        cache_mgr=cache_mgr, storage=storage,
+        max_playlist_size=config.max_playlist_size, rate_limit=config.rate_limit_search,
+        source_order=config.source_order, ytdlp_proxy=config.ytdlp_proxy, vk_token=config.vk_token,
+        vk_playlist_mode=config.vk_playlist_mode, concurrency=config.concurrency,
     )
 
-    # Регистрируем роутеры
     dp.include_router(start.router)
     dp.include_router(link.router)
     dp.include_router(status.router)
     dp.include_router(cancel.router)
     dp.include_router(stats.router)
-    dp.include_router(playlist.router)  # Последним — чтобы не перехватывал команды
+    dp.include_router(playlist.router)
 
-    # Создаём событие для graceful shutdown
     _shutdown_event = asyncio.Event()
-
-    # Настраиваем обработчики сигналов
     loop = asyncio.get_event_loop()
 
     def create_signal_handler(sig_name: str):
         def handler(sig, frame):
-            asyncio.create_task(_shutdown(sig_name, scraper, cache_mgr, bot))
-            if _shutdown_event:
-                _shutdown_event.set()
+            asyncio.create_task(_shutdown(sig_name, cache_mgr, bot))
         return handler
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, create_signal_handler(sig.name))
         except NotImplementedError:
-            # Windows не поддерживает add_signal_handler
             pass
 
-    # Периодическая очистка кэша (каждые 6 часов)
     async def cache_cleanup_loop():
         while not (_shutdown_event and _shutdown_event.is_set()):
             try:
-                await asyncio.sleep(6 * 3600)  # 6 часов
+                await asyncio.sleep(6 * 3600)
                 if _shutdown_event and _shutdown_event.is_set():
                     break
-                deleted = cache_mgr.cleanup()
+                deleted = await cache_mgr.cleanup()
                 if deleted:
                     _log.info("scheduled_cache_cleanup", deleted=deleted)
             except asyncio.CancelledError:
@@ -179,51 +131,35 @@ async def main():
 
     cleanup_task = asyncio.create_task(cache_cleanup_loop())
 
-    # Выбираем режим: webhook или polling
     if config.webhook_mode and config.webhook_url:
         _log.info("starting_webhook", url=config.webhook_url)
-
-        # Удаляем старый webhook если есть
         await bot.delete_webhook(drop_pending_updates=True)
-
-        # Устанавливаем новый webhook
         webhook_url = config.webhook_url.rstrip("/") + config.webhook_path
-        await bot.set_webhook(
-            url=webhook_url,
-            secret_token=config.webhook_secret,
-        )
-
-        # Создаем aiohttp веб-сервер
+        await bot.set_webhook(url=webhook_url, secret_token=config.webhook_secret)
         from aiohttp import web
-
         async def handle_webhook(request):
-            """Обработчик входящих webhook запросов."""
-            await dp.feed_webhook_update(bot, request.data)
-            return web.Response(text="OK")
-
+            try:
+                update = await request.json()
+                await dp.feed_webhook_update(bot, update)
+                return web.Response(text="OK")
+            except Exception as e:
+                _log.error("webhook_handle_error", error=str(e))
+                return web.Response(text="Error", status=500)
         app = web.Application()
         app.router.add_post(config.webhook_path, handle_webhook)
-
-        # Запускаем веб-сервер
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host="0.0.0.0", port=8080)
         await site.start()
-
         _log.info("webhook_server_started", port=8080, path=config.webhook_path)
-
-        # Ждем сигнал shutdown
         try:
             await _shutdown_event.wait()
         finally:
             await runner.cleanup()
-
     else:
-        # Обычный polling режим
         retry_delay = 5
         max_retry_delay = 60
         polling_active = True
-
         try:
             while polling_active:
                 try:
@@ -231,30 +167,21 @@ async def main():
                     _log.info("bot_started", bot_id=me.id)
                     await dp.start_polling(bot)
                     break
-                except (TelegramNetworkError, ProxyError) as e:
+                except (TelegramNetworkError, ProxyError, asyncio.IncompleteReadError, OSError) as e:
                     if _shutdown_event and _shutdown_event.is_set():
                         polling_active = False
                         break
-                    _log.warning(
-                        "telegram_network_error",
-                        error=str(e),
-                        retry_in_seconds=retry_delay,
-                    )
+                    _log.warning("telegram_network_error", error=str(e), retry_in_seconds=retry_delay)
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, max_retry_delay)
-    finally:
-        # Останавливаем фоновые задачи
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-
-        # Очищаем ресурсы
-        await _shutdown("polling_exit", scraper, cache_mgr, bot)
+        finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            await _shutdown("polling_exit", cache_mgr, bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-

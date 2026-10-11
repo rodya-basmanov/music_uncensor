@@ -51,7 +51,6 @@ async def cmd_status(message: Message):
     ])
 
     if status.done:
-        emoji = "✅" if status.errors == 0 else "⚠️"
         state = "Завершена" if status.errors == 0 else "Завершена с ошибками"
         state_emoji = "🏁" if status.errors == 0 else "⚠️"
     else:
@@ -103,7 +102,6 @@ async def refresh_status(callback: CallbackQuery):
     ])
 
     if status.done:
-        emoji = "✅" if status.errors == 0 else "⚠️"
         state = "Завершена" if status.errors == 0 else "Завершена с ошибками"
         state_emoji = "🏁" if status.errors == 0 else "⚠️"
     else:

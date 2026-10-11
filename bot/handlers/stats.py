@@ -27,7 +27,6 @@ async def cmd_stats(message: Message):
 
     stats = get_stats()
 
-    # Вычисляем дополнительные метрики
     cache_rate = 0
     if stats["total_sent"] > 0:
         cache_rate = int(stats["total_cached"] / stats["total_sent"] * 100)
