@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    container_name: vk_music_bot
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

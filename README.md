@@ -54,6 +54,7 @@
 | ⚡ **Параллельно** | Пул воркеров + троттлинг отправки (защита от FloodWait) |
 | 💾 **Кэш** | SHA256 → повторная отправка через `file_id` без скачивания |
 | 🎨 **Rich-интерфейс** | Меню, справка, пикер, живой статус и статистика — rich-сообщения + цветные кнопки |
+| 🐳 **Docker** | Запуск одной командой `docker compose up -d` (ffmpeg внутри образа) |
 
 ## 🚀 Быстрый старт
 
@@ -69,6 +70,19 @@ python bot/main.py
 
 > **ffmpeg** нужен для конвертации в MP3 — если системного нет, `imageio-ffmpeg` подставит свой.
 > Для YouTube в РФ нужен прокси (см. `YTDLP_PROXY`).
+
+## 🐳 Docker
+
+Запуск одной командой (ffmpeg и все зависимости — внутри образа):
+
+```bash
+cp .env.example .env          # заполните BOT_TOKEN, VK_TOKEN, прокси
+docker compose up -d --build
+docker compose logs -f        # логи
+```
+
+Данные (кэш, `users.json`, `stats.json`) лежат в `./data` (том, переживает перезапуск).
+Обновление: `git pull && docker compose up -d --build`. Остановить: `docker compose down`.
 
 ## ⚙️ Конфигурация (`.env`)
 
@@ -195,12 +209,16 @@ vk_music/
 │   ├── processor.py            # оркестрация: поиск → скачивание → отправка
 │   └── tg_sender.py            # отправка аудио + троттлинг/FloodWait
 ├── utils/
-│   ├── config.py  helpers.py  logger.py  storage.py  ui.py
+│   ├── config.py  helpers.py  logger.py  storage.py  ui.py  rich.py
 │   ├── ffmpeg.py               # путь к ffmpeg, ресайз обложек
 │   ├── links.py                # распознавание ссылок YouTube
 │   └── vk_link.py              # распознавание ссылок ВК
+├── tests/                      # pytest (юнит-тесты, без сети)
+├── .github/workflows/ci.yml    # CI: pytest на Python 3.11/3.12
+├── Dockerfile  docker-compose.yml  .dockerignore
 ├── .env.example
-└── requirements.txt
+├── requirements.txt
+└── requirements-dev.txt
 ```
 
 ## 🔧 Устранение проблем
@@ -228,11 +246,11 @@ CI (GitHub Actions) прогоняет их на Python 3.11 и 3.12 при ка
 
 ## 🗺 To do
 
-- 🎨 **Кастомные (анимированные) эмодзи** в меню и кнопках. Нужен Telegram Premium
+- [ ] 🎨 **Кастомные (анимированные) эмодзи** в меню и кнопках. Нужен Telegram Premium
   у владельца бота (работает только в ЛС); для каналов — username на Fragment.
   Готово к включению одной настройкой.
-- 🧪 **Тесты и CI** (GitHub Actions).
-- 🐳 **Docker / деплой** — чтобы бот жил на сервере.
+- [x] 🧪 **Тесты и CI** (GitHub Actions).
+- [x] 🐳 **Docker / деплой** — чтобы бот жил на сервере.
 
 ## 📜 Лицензия
 
