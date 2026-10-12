@@ -2,12 +2,12 @@
 
 from utils.helpers import (
     Track,
-    parse_track_line,
-    generate_hash,
     clean_artist_for_search,
-    clean_title_for_search,
     clean_title_for_display,
+    clean_title_for_search,
     format_duration,
+    generate_hash,
+    parse_track_line,
 )
 
 

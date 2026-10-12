@@ -1,9 +1,9 @@
 """Хендлер /status — проверка прогресса задачи."""
 
-from aiogram import Router, F
-from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram import F, Router
 from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from services.processor import get_task_status
 

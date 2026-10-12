@@ -1,11 +1,14 @@
 """Хендлеры /start и /help."""
 
-from aiogram import Router, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
-)
+from aiogram import F, Router
 from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from utils.logger import get_logger
 from utils.rich import send_rich

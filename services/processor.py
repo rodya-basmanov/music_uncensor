@@ -18,26 +18,27 @@ from core.cache_manager import CacheManager
 from core.cover import download_image
 from core.scraper import soundcloud, youtube
 from core.scraper.common import (
-    DownloadResult,
     Candidate,
+    DownloadResult,
     download_audio,
     rank_candidates,
     score_candidate,
     split_artist_title,
 )
 from services.tg_sender import TelegramSender
+from utils.escape import esc_html, esc_md
+from utils.ffmpeg import make_thumbnail
 from utils.helpers import (
     Track,
-    generate_hash,
     clean_artist_for_search,
-    clean_title_for_search,
     clean_title_for_display,
+    clean_title_for_search,
     format_duration,
+    generate_hash,
 )
-from utils.ffmpeg import make_thumbnail
 from utils.logger import get_logger
-from utils.rich import send_rich, edit_rich
-from utils.ui import progress_bar, is_mashup, source_icon
+from utils.rich import edit_rich, send_rich
+from utils.ui import is_mashup, progress_bar
 
 log = get_logger("processor")
 
@@ -104,6 +105,35 @@ class TaskStatus:
 _tasks: Dict[str, TaskStatus] = {}
 # Активные задачи по user_id (для ограничения 1 задача/юзер)
 _active_users: set = set()
+
+# Кнопка «Не тот трек» под аудио в канале: token -> {query, channel_id, user_id, created}
+_redo_pending: Dict[str, dict] = {}
+
+
+def register_redo(query: str, channel_id: int, user_id: int) -> str:
+    """Регистрирует запрос для кнопки «Не тот трек» и возвращает токен."""
+    now = time.time()
+    for t in [t for t, v in _redo_pending.items() if now - v["created"] > 3600]:
+        _redo_pending.pop(t, None)
+    token = uuid.uuid4().hex[:8]
+    _redo_pending[token] = {
+        "query": query, "channel_id": channel_id, "user_id": user_id, "created": now,
+    }
+    return token
+
+
+def get_redo(token: str) -> Optional[dict]:
+    return _redo_pending.get(token)
+
+
+def _redo_keyboard(query: str, channel_id: int, user_id: int) -> Optional[InlineKeyboardMarkup]:
+    """Кнопка «Не тот трек» (если известен пользователь)."""
+    if not user_id or not query:
+        return None
+    token = register_redo(query, channel_id, user_id)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔁 Не тот трек", callback_data=f"fix|{token}", style="primary"),
+    ]])
 
 # Статистика (глобальная)
 _stats = {
@@ -210,10 +240,10 @@ async def process_playlist(
     user_id: int,
     channel_id: int,
     tracks: List[Track],
+    bot: Bot,
+    cache_mgr: CacheManager,
     playlist_name: str | None = None,
     total_duration: int = 0,
-    bot: Bot = None,
-    cache_mgr: CacheManager = None,
     rate_limit: float = 2.0,
     source_order: List[str] | None = None,
     ytdlp_proxy: str = "",
@@ -249,8 +279,20 @@ def _status_keyboard(task_id: str) -> InlineKeyboardMarkup:
     ]])
 
 
+def _eta_str(status: TaskStatus, final: bool) -> str:
+    """Оценка оставшегося времени (ETA) по средней скорости обработки."""
+    if final or status.processed <= 0 or status.processed >= status.total:
+        return ""
+    elapsed = time.time() - status.started_at
+    avg = elapsed / status.processed
+    secs = int(avg * (status.total - status.processed))
+    if secs <= 0:
+        return ""
+    return format_duration(secs)
+
+
 def _render_status(status: TaskStatus, final: bool = False) -> str:
-    """Единый текст живой статус-записи."""
+    """Единый текст живой статус-записи (HTML)."""
     if final:
         head = "⏹️ <b>Задача отменена</b>" if status.cancelled else "🏁 <b>Плейлист обработан</b>"
     else:
@@ -258,13 +300,16 @@ def _render_status(status: TaskStatus, final: bool = False) -> str:
 
     lines = [head]
     if status.playlist_name:
-        lines.append(f"🎧 {status.playlist_name}")
+        lines.append(f"🎧 {esc_html(status.playlist_name)}")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(progress_bar(status.processed, status.total))
     lines.append(f"📊 <b>{status.processed}</b>/{status.total}")
     if not final and status.current_track:
-        lines.append(f"🎵 {status.current_track[:50]}")
+        lines.append(f"🎵 {esc_html(status.current_track[:50])}")
     lines.append(f"✅ {status.sent}   ⚡ {status.cached}   ❌ {status.not_found}   ⚠️ {status.errors}")
+    eta = _eta_str(status, final)
+    if eta:
+        lines.append(f"⏳ Осталось: ~{eta}")
     if final:
         lines.append(f"⏱ Время: {int(time.time() - status.started_at)} сек")
     lines.append("")
@@ -272,7 +317,7 @@ def _render_status(status: TaskStatus, final: bool = False) -> str:
     if final and status.failed_tracks:
         lines.append("\n❌ <b>Не найдены:</b>")
         for ft in status.failed_tracks[:20]:
-            lines.append(f"  • {ft}")
+            lines.append(f"  • {esc_html(ft)}")
     return "\n".join(lines)
 
 
@@ -303,13 +348,16 @@ def _render_status_md(status: TaskStatus, final: bool = False) -> str:
 
     lines = [head]
     if status.playlist_name:
-        lines.append(f"🎧 **{status.playlist_name}**")
+        lines.append(f"🎧 **{esc_md(status.playlist_name)}**")
     lines.append("")
     lines.append(progress_bar(status.processed, status.total))
     lines.append(f"**{status.processed}**/{status.total}")
     if not final and status.current_track:
-        lines.append(f"🎵 {status.current_track[:50]}")
+        lines.append(f"🎵 {esc_md(status.current_track[:50])}")
     lines.append(f"✅ {status.sent}   ⚡ {status.cached}   ❌ {status.not_found}   ⚠️ {status.errors}")
+    eta = _eta_str(status, final)
+    if eta:
+        lines.append(f"⏳ Осталось: ~{eta}")
     if final:
         lines.append(f"⏱ Время: {int(time.time() - status.started_at)} сек")
     lines.append("")
@@ -318,7 +366,7 @@ def _render_status_md(status: TaskStatus, final: bool = False) -> str:
         lines.append("")
         lines.append("**❌ Не найдены:**")
         for ft in status.failed_tracks[:20]:
-            lines.append(f"- {ft}")
+            lines.append(f"- {esc_md(ft)}")
     return "\n".join(lines)
 
 
@@ -382,9 +430,9 @@ async def _process_tracks(
             try:
                 await send_rich(
                     bot, status.channel_id,
-                    f"# 🎧 {playlist_name or 'Плейлист'}\n\n🎵 Треков: **{len(tracks)}**   ⏱ ~{duration_str}",
+                    f"# 🎧 {esc_md(playlist_name or 'Плейлист')}\n\n🎵 Треков: **{len(tracks)}**   ⏱ ~{duration_str}",
                     fallback=(
-                        f"🎧 <b>{playlist_name or 'Плейлист'}</b>\n"
+                        f"🎧 <b>{esc_html(playlist_name or 'Плейлист')}</b>\n"
                         f"🎵 Треков: <b>{len(tracks)}</b>   ⏱ ~{duration_str}"
                     ),
                 )
@@ -401,7 +449,7 @@ async def _process_tracks(
                 await _edit_status(bot, status)
 
                 result = await _process_single_track(
-                    track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
+                    track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode, status.user_id,
                 )
                 _apply_result(status, track, result)
                 await _edit_status(bot, status)
@@ -422,7 +470,7 @@ async def _process_tracks(
                         return
                     try:
                         result = await _process_single_track(
-                            track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
+                            track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode, status.user_id,
                         )
                     except Exception as e:
                         log.error("track_worker_error", error=str(e), title=track.title)
@@ -559,6 +607,7 @@ async def _download_and_send(
     original_title: str = "",
     query: str = "",
     vk_cover_url: str = "",
+    user_id: int = 0,
 ) -> Optional[dict]:
     """Скачивает конкретного кандидата и отправляет в канал.
 
@@ -620,7 +669,8 @@ async def _download_and_send(
         shutil.rmtree(work_dir, ignore_errors=True)
 
     send_track = Track(artist=disp_artist, title=disp_title, duration=duration)
-    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None)
+    redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
+    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None, reply_markup=redo_kb)
 
     cache_mgr.save(hash_key, {
         "artist": original_artist or query,
@@ -686,7 +736,7 @@ async def process_picked_candidate(
     _bump(total_tracks=1)
     info = await _download_and_send(
         cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key, "", 0, "", "", query,
-        vk_cover_url,
+        vk_cover_url, user_id,
     )
     if not info:
         _bump(total_not_found=1)
@@ -700,6 +750,7 @@ async def _download_vk_and_send(
     sender: TelegramSender,
     hash_key: str,
     ytdlp_proxy: str = "",
+    user_id: int = 0,
 ) -> Optional[dict]:
     """Скачивает трек напрямую из VK (точная версия + обложка)."""
     work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
@@ -717,7 +768,8 @@ async def _download_vk_and_send(
     disp_title = track.title.strip() or "Unknown"
     send_track = Track(artist=disp_artist, title=disp_title, duration=track.duration)
 
-    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None)
+    redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
+    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None, reply_markup=redo_kb)
     cache_mgr.save(hash_key, {
         "artist": track.artist,
         "title": track.title,
@@ -744,6 +796,7 @@ async def _process_single_track(
     source_order: List[str],
     ytdlp_proxy: str = "",
     mode: str = "uncensored",
+    user_id: int = 0,
 ) -> str:
     hash_key = generate_hash(track.artist or track.query or "", track.title)
     vk_available = track.source == "vk" and bool(track.url)
@@ -760,9 +813,10 @@ async def _process_single_track(
             title=cached.get("display_title") or track.title,
             duration=track.duration,
         )
+        redo_kb = _redo_keyboard(f"{send_track.artist} {send_track.title}".strip(), channel_id, user_id)
         if file_id:
             try:
-                res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover)
+                res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover, reply_markup=redo_kb)
                 if res.get("cover_file_id") and not cached.get("cover_file_id"):
                     cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
                 cache_mgr.update_access(hash_key)
@@ -771,7 +825,7 @@ async def _process_single_track(
             except Exception:
                 pass
         if file_path and os.path.exists(file_path):
-            res = await sender.send_file(channel_id, file_path, send_track, cover=cover)
+            res = await sender.send_file(channel_id, file_path, send_track, cover=cover, reply_markup=redo_kb)
             if res.get("file_id"):
                 cache_mgr.save_file_id(hash_key, res["file_id"])
             if res.get("cover_file_id"):
@@ -781,7 +835,7 @@ async def _process_single_track(
 
     # --- VK: режим «Всё из VK» ---
     if mode == "vk" and vk_available:
-        info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy)
+        info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id)
         if info:
             log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
             return "sent_new"
@@ -817,7 +871,7 @@ async def _process_single_track(
                 info = await _download_and_send(
                     cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key,
                     artist_hint, track.duration, track.artist, track.title, query,
-                    track.cover_url,
+                    track.cover_url, user_id,
                 )
                 if info:
                     log.info("track_sent", source=info["source"], display=f"{info['artist']} - {info['title']}")
@@ -825,7 +879,7 @@ async def _process_single_track(
 
         # Fallback: ничего не нашли в uncensored-источниках → отдаём версию из VK
         if mode != "vk" and vk_available:
-            info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy)
+            info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id)
             if info:
                 log.info("track_sent_vk_fallback", display=f"{info['artist']} - {info['title']}")
                 return "sent_new"

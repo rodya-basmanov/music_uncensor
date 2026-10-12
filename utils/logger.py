@@ -1,6 +1,7 @@
 """Настройка логирования через structlog."""
 
 import logging
+
 import structlog
 
 

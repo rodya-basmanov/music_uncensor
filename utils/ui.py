@@ -10,6 +10,22 @@ _MASHUP_RE = re.compile(
     re.IGNORECASE,
 )
 
+_LIVE_RE = re.compile(
+    r"(?<![a-zа-я0-9])(live|concert|orchestral|acoustic)(?![a-zа-я0-9])",
+    re.IGNORECASE,
+)
+
+
+def version_tag(title: str) -> str:
+    """Значки версии трека для пикера: 🎬 live/концерт, 🔀 ремикс/слоу/мешап."""
+    text = title or ""
+    tag = ""
+    if _LIVE_RE.search(text):
+        tag += "🎬"
+    if _MASHUP_RE.search(text):
+        tag += "🔀"
+    return tag
+
 
 def progress_bar(done: int, total: int, length: int = 10,
                  filled: str = "🟩", empty: str = "⬜") -> str:

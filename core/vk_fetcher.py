@@ -1,7 +1,7 @@
 """Получение треков из плейлиста ВКонтакте через vk_api."""
 
 import asyncio
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import vk_api
 
@@ -27,8 +27,8 @@ class VKFetcher:
 
     def __init__(self, token: str):
         self.token = token
-        self._session = None
-        self._api = None
+        self._session: Any = None
+        self._api: Any = None
 
     def _ensure_session(self) -> None:
         """Создаёт сессию VK API если ещё не создана."""
@@ -45,13 +45,13 @@ class VKFetcher:
     ) -> List[Track]:
         """
         Получает список треков из плейлиста VK.
-        
+
         Args:
             owner_id: ID владельца плейлиста
             playlist_id: ID плейлиста (album_id)
             access_key: Ключ доступа (для приватных плейлистов)
             count: Макс. количество треков
-            
+
         Returns:
             Список Track
         """
@@ -121,13 +121,13 @@ class VKFetcher:
         offset: int = 0,
     ) -> list:
         """Пробует несколько методов VK API для получения треков плейлиста."""
-        audio_get_params = {
+        audio_get_params: dict[str, Any] = {
             "owner_id": owner_id,
             "album_id": playlist_id,
             "count": count,
             "offset": offset,
         }
-        playlist_by_id_params = {
+        playlist_by_id_params: dict[str, Any] = {
             "owner_id": owner_id,
             "playlist_id": playlist_id,
         }

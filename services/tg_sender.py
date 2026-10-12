@@ -6,7 +6,7 @@ import time
 from typing import Optional
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import FSInputFile
 
 from utils.helpers import Track
@@ -55,7 +55,7 @@ class TelegramSender:
     async def _send_with_retry(self, make_call, max_retries: int = 6):
         """Вызывает make_call с троттлингом и retry на FloodWait/сетевые ошибки."""
         global _blocked_until
-        last_exc = None
+        last_exc: Optional[Exception] = None
         for attempt in range(max_retries):
             await _throttle()
             try:
@@ -75,7 +75,7 @@ class TelegramSender:
             raise last_exc
         raise RuntimeError("send failed")
 
-    async def send_by_file_id(self, channel_id: int, file_id: str, track: Track, cover=None) -> dict:
+    async def send_by_file_id(self, channel_id: int, file_id: str, track: Track, cover=None, reply_markup=None) -> dict:
         """Отправляет аудио по кэшированному file_id (без загрузки файла)."""
         result = await self._send_with_retry(lambda: self.bot.send_audio(
             chat_id=channel_id,
@@ -83,6 +83,7 @@ class TelegramSender:
             performer=track.artist or None,
             title=track.title or None,
             thumbnail=_cover_input(cover),
+            reply_markup=reply_markup,
         ))
         cover_file_id = ""
         if result.audio and result.audio.thumbnail:
@@ -90,7 +91,7 @@ class TelegramSender:
         log.info("sent_by_file_id", artist=track.artist, title=track.title, channel=channel_id)
         return {"file_id": file_id, "cover_file_id": cover_file_id}
 
-    async def send_file(self, channel_id: int, file_path: str, track: Track, cover=None) -> dict:
+    async def send_file(self, channel_id: int, file_path: str, track: Track, cover=None, reply_markup=None) -> dict:
         """Загружает и отправляет mp3 с обложкой."""
         result = await self._send_with_retry(lambda: self.bot.send_audio(
             chat_id=channel_id,
@@ -99,6 +100,7 @@ class TelegramSender:
             title=track.title or None,
             duration=track.duration if track.duration > 0 else None,
             thumbnail=_cover_input(cover),
+            reply_markup=reply_markup,
         ))
         file_id = result.audio.file_id if result.audio else None
         cover_file_id = ""

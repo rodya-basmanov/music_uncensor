@@ -1,27 +1,25 @@
 """Точка входа бота — инициализация и запуск polling."""
 
 import asyncio
+import os
 import signal
 import sys
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sentry_sdk
-from sentry_sdk import capture_exception
-
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import BotCommand
 from python_socks import ProxyError
+from sentry_sdk import capture_exception
 
-from bot.handlers import start, link, playlist, status, cancel, stats
+from bot.handlers import cancel, link, playlist, start, stats, status
 from core.cache_manager import CacheManager
 from services import processor, tg_sender
 from utils.config import load_config
-from utils.logger import setup_logging, get_logger
+from utils.logger import get_logger, setup_logging
 from utils.storage import UserStorage
 
 _shutdown_event: asyncio.Event | None = None

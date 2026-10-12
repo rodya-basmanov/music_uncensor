@@ -1,12 +1,12 @@
 """Хендлеры привязки каналов: /link, /channels, /unlink."""
 
 from aiogram import Router
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.enums import ParseMode
 
-from utils.storage import UserStorage
 from utils.logger import get_logger
+from utils.storage import UserStorage
 
 log = get_logger("link_handler")
 

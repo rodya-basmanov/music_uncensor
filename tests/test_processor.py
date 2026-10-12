@@ -1,7 +1,7 @@
 """Тесты логики процессора (services/processor.py) — чистые функции."""
 
 from core.scraper.common import Candidate, DownloadResult
-from services.processor import _is_junk, _effective_order, _resolve_display
+from services.processor import _effective_order, _is_junk, _resolve_display
 
 
 def test_is_junk():

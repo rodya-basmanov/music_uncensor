@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from rapidfuzz import fuzz
 

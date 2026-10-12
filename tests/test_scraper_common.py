@@ -3,11 +3,11 @@
 from core.scraper.common import (
     Candidate,
     is_remix,
-    uploader_matches,
     normalize,
-    split_artist_title,
-    rank_candidates,
     parse_search_output,
+    rank_candidates,
+    split_artist_title,
+    uploader_matches,
 )
 
 

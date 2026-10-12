@@ -1,6 +1,5 @@
 """Загрузка обложек (VK/источник) через aiohttp с опциональным прокси."""
 
-import os
 
 import aiohttp
 from aiohttp_socks import ProxyConnector

@@ -1,0 +1,16 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [ "E", "F", "W", "I" ]
+ignore = [ "E501" ]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = false
+warn_unused_ignores = false
+no_implicit_optional = false
+files = [ "utils", "core", "services" ]

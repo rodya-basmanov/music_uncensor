@@ -38,7 +38,7 @@ class CacheManager:
     def get(self, hash_key: str) -> Optional[Dict[str, Any]]:
         """
         Получает метаданные из кэша по хешу.
-        
+
         Returns:
             Словарь метаданных или None
         """

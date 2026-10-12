@@ -1,6 +1,6 @@
 """Тесты UI-хелперов (utils/ui.py)."""
 
-from utils.ui import progress_bar, is_mashup, source_icon, fmt_duration_mmss
+from utils.ui import fmt_duration_mmss, is_mashup, progress_bar, source_icon, version_tag
 
 
 def test_progress_bar():
@@ -29,3 +29,10 @@ def test_fmt_duration_mmss():
     assert fmt_duration_mmss(0) == "?"
     assert fmt_duration_mmss(3661) == "1:01:01"
     assert fmt_duration_mmss(None) == "?"
+
+
+def test_version_tag():
+    assert version_tag("Song (Live)") == "🎬"
+    assert version_tag("Song remix") == "🔀"
+    assert version_tag("Song (Live) remix") == "🎬🔀"
+    assert version_tag("Обычный трек") == ""

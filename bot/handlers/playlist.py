@@ -11,32 +11,34 @@ import os
 import tempfile
 import time
 import uuid
-
-from aiogram import Router, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.enums import ParseMode
 from dataclasses import dataclass
+
+from aiogram import F, Router
+from aiogram.enums import ParseMode
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from core.cache_manager import CacheManager
 from core.scraper.common import Candidate
 from core.vk_fetcher import VKFetcher
 from services.processor import (
-    process_playlist,
-    process_picked_candidate,
-    search_all,
+    get_redo,
     is_user_busy,
+    process_picked_candidate,
+    process_playlist,
+    search_all,
 )
+from utils.escape import esc_html, esc_md
 from utils.helpers import (
     Track,
-    parse_track_line,
     clean_artist_for_search,
     clean_title_for_search,
+    parse_track_line,
 )
+from utils.links import find_youtube_link
 from utils.logger import get_logger
 from utils.rich import edit_rich
 from utils.storage import UserStorage
-from utils.ui import source_icon, fmt_duration_mmss
-from utils.links import find_youtube_link
+from utils.ui import fmt_duration_mmss, source_icon, version_tag
 from utils.vk_link import find_vk_link, parse_vk_link, parse_vk_track_link
 
 log = get_logger("playlist_handler")
@@ -202,7 +204,7 @@ async def _send_direct(message: Message, cand: Candidate, label: str, user_id: i
         InlineKeyboardButton(text="🔁 Найти варианты", callback_data=f"reopen|{token}"),
     ]])
     await status.edit_text(
-        f"✅ Отправлено в канал:\n<b>{info['artist']} — {info['title']}</b>",
+        f"✅ Отправлено в канал:\n<b>{esc_html(info['artist'])} — {esc_html(info['title'])}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -285,11 +287,12 @@ def _picker_text(data: dict, page: int) -> str:
     filt = data.get("filter", "all")
     idxs = data["filters"].get(filt, [])
     total_pages = max(1, (len(idxs) + _PICK_PAGE_SIZE - 1) // _PICK_PAGE_SIZE)
-    title = data.get("title") or f"🔍 <i>{data['query']}</i>"
+    title = data.get("title")
+    title_html = f"<b>{esc_html(title)}</b>" if title else f"🔍 <i>{esc_html(data['query'])}</i>"
     return (
         f"🎧 <b>Результаты</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{title}\n"
+        f"{title_html}\n"
         f"Найдено: <b>{len(idxs)}</b>  ·  фильтр: {_FILTER_LABEL.get(filt, filt)}\n"
         f"Страница <b>{page + 1}</b>/{total_pages}\n\n"
         f"Выбери трек 👇"
@@ -300,10 +303,11 @@ def _picker_md(data: dict, page: int) -> str:
     filt = data.get("filter", "all")
     idxs = data["filters"].get(filt, [])
     total_pages = max(1, (len(idxs) + _PICK_PAGE_SIZE - 1) // _PICK_PAGE_SIZE)
-    title = data.get("title") or f"🔍 **{data['query']}**"
+    title = data.get("title")
+    title_md = f"**{esc_md(title)}**" if title else f"🔍 **{esc_md(data['query'])}**"
     return (
         f"# 🎧 Результаты\n\n"
-        f"{title}\n\n"
+        f"{title_md}\n\n"
         f"Найдено: **{len(idxs)}**  ·  фильтр: {_FILTER_LABEL.get(filt, filt)}\n\n"
         f"Страница **{page + 1}**/{total_pages}\n\n"
         f"Выбери трек 👇"
@@ -321,8 +325,9 @@ def _picker_keyboard(token: str, data: dict, page: int) -> InlineKeyboardMarkup:
     for j, gi in enumerate(page_idx):
         c = data["all"][gi]
         icon = source_icon(c.source)
+        tag = version_tag(c.title)
         artist = c.artist or c.uploader or ""
-        label = f"{start + j + 1}. {c.title}"
+        label = f"{start + j + 1}. {icon} " + (f"{tag} " if tag else "") + c.title
         if artist:
             label += f" — {artist}"
         label += f" · {fmt_duration_mmss(c.duration)}"
@@ -377,8 +382,13 @@ async def _show_picker(message: Message, query: str, channel_id: int, user_id: i
         await message.answer("⏳ У вас уже выполняется задача. Дождитесь завершения или /cancel.")
         return
 
+    await _picker_flow(message.bot, message.chat.id, user_id, query, channel_id)
+
+
+async def _picker_flow(bot, chat_id: int, user_id: int, query: str, channel_id: int) -> None:
+    """Поиск и показ пикера в указанный чат (ЛС)."""
     _cleanup_picks()
-    status = await message.answer(f"🔎 Ищу: <i>{query}</i>...", parse_mode=ParseMode.HTML)
+    status = await bot.send_message(chat_id, f"🔎 Ищу: <i>{esc_html(query)}</i>...", parse_mode=ParseMode.HTML)
     try:
         all_c, filters = await _search_candidates(query)
     except Exception as e:
@@ -386,7 +396,7 @@ async def _show_picker(message: Message, query: str, channel_id: int, user_id: i
         all_c, filters = [], {}
 
     if not all_c:
-        await status.edit_text(f"❌ По запросу «{query}» ничего не найдено.")
+        await status.edit_text(f"❌ По запросу «{esc_html(query)}» ничего не найдено.", parse_mode=ParseMode.HTML)
         return
 
     token = uuid.uuid4().hex[:8]
@@ -571,7 +581,7 @@ async def handle_playlist_text(message: Message):
         raw_text = text
         channel_hint = None
 
-    track_lines = [l.strip() for l in raw_text.splitlines() if l.strip() and not l.strip().startswith("#")]
+    track_lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
 
     if len(track_lines) == 1:
         channel_id = _resolve_target_channel(message, channel_hint)
@@ -740,7 +750,7 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
                              cover_url=track.cover_url, source="vk")
 
     status = await base_message.answer(
-        f"🎛 Трек {i + 1}/{len(tracks)}: <b>{track.artist} — {track.title}</b>\n🔎 Ищу...",
+        f"🎛 Трек {i + 1}/{len(tracks)}: <b>{esc_html(track.artist)} — {esc_html(track.title)}</b>\n🔎 Ищу...",
         parse_mode=ParseMode.HTML,
     )
     try:
@@ -757,7 +767,7 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
             [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pk_skip_track|{user_id}")],
         ])
         await status.edit_text(
-            f"❌ Ничего не найдено для <b>{track.artist} — {track.title}</b>.",
+            f"❌ Ничего не найдено для <b>{esc_html(track.artist)} — {esc_html(track.title)}</b>.",
             parse_mode=ParseMode.HTML, reply_markup=kb,
         )
         return
@@ -767,7 +777,7 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
         "user_id": user_id,
         "channel_id": session["channel_id"],
         "query": query,
-        "title": f"🎛 {i + 1}/{len(tracks)} · <b>{track.artist} — {track.title}</b>",
+        "title": f"🎛 {i + 1}/{len(tracks)} · {track.artist} — {track.title}",
         "created": time.time(),
         "all": all_c,
         "filters": filters,
@@ -837,7 +847,7 @@ async def cb_pick(callback: CallbackQuery):
             pass
         return
 
-    success_text = f"✅ Отправлено в канал:\n<b>{info['artist']} — {info['title']}</b>"
+    success_text = f"✅ Отправлено в канал:\n<b>{esc_html(info['artist'])} — {esc_html(info['title'])}</b>"
 
     if data.get("pk_session") is not None:
         session = _pick_sessions.get(data["pk_session"])
@@ -859,6 +869,21 @@ async def cb_pick(callback: CallbackQuery):
     except Exception:
         await callback.message.answer(success_text, parse_mode=ParseMode.HTML, reply_markup=kb)
     # pending оставляем — чтобы можно было выбрать «другой вариант»
+
+
+@router.callback_query(F.data.startswith("fix|"))
+async def cb_fix(callback: CallbackQuery):
+    """Кнопка «Не тот трек» под аудио в канале — открыть варианты в ЛС."""
+    token = callback.data.split("|", 1)[1]
+    data = get_redo(token)
+    if not data:
+        await callback.answer("⌛ Устарело — пришлите запрос заново.", show_alert=True)
+        return
+    await callback.answer("Открываю варианты в личке…")
+    try:
+        await _picker_flow(callback.bot, data["user_id"], data["user_id"], data["query"], data["channel_id"])
+    except Exception as e:
+        log.error("fix_flow_error", error=str(e))
 
 
 @router.callback_query(F.data.startswith("redo|"))
