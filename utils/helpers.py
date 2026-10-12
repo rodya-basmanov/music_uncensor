@@ -16,6 +16,7 @@ class Track:
     url: str = ""             # прямая ссылка на mp3 (VK)
     cover_url: str = ""       # прямая ссылка на обложку (VK)
     source: str = ""          # "vk" — трек получен из VK (качаем напрямую)
+    force_meta: bool = False  # форсировать artist/title в метаданных (напр. из альбома)
 
 
 def parse_track_line(line: str) -> Optional[Track]:

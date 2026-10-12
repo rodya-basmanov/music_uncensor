@@ -62,7 +62,17 @@ def test_build_caption_links():
 
 def test_build_caption_unknown_source():
     processor.set_caption(True)
-    assert processor._build_caption("https://psv4.vkuseraudio.net/x") is None
+    assert processor._build_caption("https://example.com/x") is None
+
+
+def test_build_caption_vk_has_no_mp3_link():
+    processor.set_caption(True)
+    tg_sender.set_bot_username("my_bot")
+    cap = processor._build_caption("https://psv4.vkuseraudio.net/s/v1/ac/xxx")
+    assert cap is not None
+    assert cap.startswith("🎧 VK")
+    assert "psv4.vkuseraudio" not in cap
+    assert '<a href="https://t.me/my_bot">via</a>' in cap
 
 
 def test_build_caption_disabled():

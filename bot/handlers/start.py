@@ -1,7 +1,6 @@
 """Хендлеры /start и /help."""
 
 from aiogram import F, Router
-from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -29,7 +28,7 @@ async def _send_menu(chat_id: int, bot, rich_md: str, fallback_html: str, reply_
 @router.callback_query(F.data == "show_guide")
 async def cb_show_guide(callback: CallbackQuery):
     await callback.answer()
-    await _send_menu(callback.message.chat.id, callback.message.bot, START_RICH, START_TEXT, _get_main_keyboard())
+    await _send_menu(callback.message.chat.id, callback.message.bot, HELP_RICH, HELP_TEXT, _get_back_keyboard())
 
 
 @router.callback_query(F.data == "show_help")
@@ -48,20 +47,37 @@ async def cb_show_link_help(callback: CallbackQuery):
 async def cb_show_channels(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
-    if _storage:
-        channels = _storage.get_channels(user_id)
-        if channels:
-            default = _storage.get_default_channel(user_id)
-            lines = ["📡 <b>Ваши каналы</b>\n━━━━━━━━━━━━━━━━━━━━"]
-            for ch in channels:
-                marker = "  ⭐ <i>по умолчанию</i>" if ch == default else ""
-                lines.append(f"• <code>{ch}</code>{marker}")
-            lines.append("\n🔗 /link <code>-100XXX</code> — сменить\n🗑 /unlink <code>-100XXX</code> — отвязать")
-            await callback.message.answer("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=_get_back_keyboard())
-        else:
-            await callback.message.answer("📭 Нет привязанных каналов.\nДобавь бота в канал админом и отправь там /link.", reply_markup=_get_back_keyboard())
-    else:
+    if not _storage:
         await callback.message.answer("⚠️ Хранилище недоступно.", reply_markup=_get_back_keyboard())
+        return
+    channels = _storage.get_channels(user_id)
+    if not channels:
+        await callback.message.answer(
+            "📭 Нет привязанных каналов.\nДобавь бота в канал админом и отправь там /link.",
+            reply_markup=_get_back_keyboard(),
+        )
+        return
+    default = _storage.get_default_channel(user_id)
+
+    md = ["# 📡 Ваши каналы", ""]
+    for ch in channels:
+        marker = "  ⭐ _по умолчанию_" if ch == default else ""
+        md.append(f"- `{ch}`{marker}")
+    md.append("")
+    md.append("🔗 /link `-100XXX` — сменить")
+    md.append("🗑 /unlink `-100XXX` — отвязать")
+    rich_md = "\n".join(md)
+
+    lines = ["📡 <b>Ваши каналы</b>"]
+    for ch in channels:
+        marker = "  ⭐ <i>по умолчанию</i>" if ch == default else ""
+        lines.append(f"• <code>{ch}</code>{marker}")
+    lines.append("\n🔗 /link <code>-100XXX</code> — сменить\n🗑 /unlink <code>-100XXX</code> — отвязать")
+
+    await send_rich(
+        callback.message.bot, callback.message.chat.id, rich_md,
+        reply_markup=_get_back_keyboard(), fallback="\n".join(lines),
+    )
 
 
 @router.callback_query(F.data == "main_menu")
@@ -82,6 +98,7 @@ def _get_main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Мои каналы", callback_data="show_channels", style="primary"),
         ],
         [
+            InlineKeyboardButton(text="💿 Альбом", callback_data="album_ask", style="primary"),
             InlineKeyboardButton(text="📖 Инструкция", callback_data="show_guide", style="primary"),
         ],
     ])
@@ -108,6 +125,7 @@ START_TEXT = """🎧 <b>VK Music Uncensor</b>
    🎵 <b>запрос</b> — покажу варианты на выбор
 
 ━━━━━━━━━━━━━━━━━━━━
+💿 /album — скачать альбом
 📊 /status — статус   ·   📈 /stats — статистика
 ❓ /help — все команды"""
 
@@ -121,12 +139,14 @@ HELP_TEXT = """❓ <b>Справка</b>
 • /unlink -100XXX — отвязать
 • /status id — статус задачи
 • /stats — статистика
+• /album Артист Название — скачать альбом
 • /cancel — отменить задачу
 
 <b>Отправка треков</b>
 • 🔗 ссылка на плейлист ВК — скачаю все треки
 • 📋 текст/файл — по одному треку на строку
-• 🎵 один запрос — покажу результаты, выберешь кнопкой"""
+• 🎵 один запрос — покажу результаты, выберешь кнопкой
+• 💿 /album — скачать целый альбом"""
 
 LINK_HELP_TEXT = """🔗 <b>Как привязать канал</b>
 ━━━━━━━━━━━━━━━━━━━━
@@ -166,7 +186,7 @@ _Плейлисты ВК → треки без цензуры в твоём ка
 - 📋 **список** треков (`Артист - Название`)
 - 🎵 **запрос** — покажу варианты на выбор
 
-📊 /status — статус · 📈 /stats — статистика · ❓ /help — все команды"""
+💿 /album — скачать альбом · 📊 /status — статус · 📈 /stats — статистика · ❓ /help — все команды"""
 
 HELP_RICH = """# ❓ Справка
 
@@ -178,13 +198,15 @@ HELP_RICH = """# ❓ Справка
 - /unlink -100XXX — отвязать
 - /status id — статус задачи
 - /stats — статистика
+- /album Артист Название — скачать альбом
 - /cancel — отменить задачу
 
 ## Отправка треков
 
 - 🔗 ссылка на плейлист ВК — скачаю все треки
 - 📋 текст/файл — по одному треку на строку
-- 🎵 один запрос — покажу результаты, выберешь кнопкой"""
+- 🎵 один запрос — покажу результаты, выберешь кнопкой
+- 💿 /album — скачать целый альбом"""
 
 
 @router.message(CommandStart())

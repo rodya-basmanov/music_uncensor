@@ -12,6 +12,11 @@ _YT_RE = re.compile(
 
 _SC_HOST = re.compile(r"https?://(?:www\.|m\.|on\.)?soundcloud\.com/", re.IGNORECASE)
 
+_VK_HOST = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)*(?:vk\.com|vk\.ru|vkuseraudio\.net|userapi\.com|vk-cdn\.net|mycdn\.me)/",
+    re.IGNORECASE,
+)
+
 
 def find_youtube_link(text: str) -> Optional[str]:
     """Возвращает первую ссылку YouTube в тексте (нормализованную), если есть."""
@@ -39,11 +44,13 @@ def songlink_url(source_url: str) -> Optional[str]:
 
 
 def source_label(source_url: str) -> str:
-    """Название источника по его URL (SoundCloud/YouTube) или пустая строка."""
+    """Название источника по его URL (SoundCloud/YouTube/VK) или пустая строка."""
     if not source_url:
         return ""
     if _YT_RE.search(source_url):
         return "YouTube"
     if _SC_HOST.search(source_url):
         return "SoundCloud"
+    if _VK_HOST.search(source_url):
+        return "VK"
     return ""

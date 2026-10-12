@@ -15,7 +15,7 @@ from aiogram.types import BotCommand
 from python_socks import ProxyError
 from sentry_sdk import capture_exception
 
-from bot.handlers import cancel, link, playlist, start, stats, status
+from bot.handlers import album, cancel, link, playlist, start, stats, status
 from bot.handlers import health as health_handler
 from core.cache_manager import CacheManager
 from core.scraper.common import set_pot_provider
@@ -124,6 +124,9 @@ async def main():
         ytdlp_proxy=config.ytdlp_proxy, pot_provider=config.ytdlp_pot_provider,
         vk_token=config.vk_token,
     )
+    album.set_dependencies(
+        storage=storage, ytdlp_proxy=config.ytdlp_proxy, vk_token=config.vk_token,
+    )
 
     try:
         await bot.set_my_commands([
@@ -134,6 +137,7 @@ async def main():
             BotCommand(command="unlink", description="Отвязать канал"),
             BotCommand(command="status", description="Статус задачи"),
             BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="album", description="Скачать альбом"),
             BotCommand(command="health", description="Состояние бота"),
             BotCommand(command="cancel", description="Отменить задачу"),
         ])
@@ -147,6 +151,7 @@ async def main():
     dp.include_router(cancel.router)
     dp.include_router(stats.router)
     dp.include_router(health_handler.router)
+    dp.include_router(album.router)
     dp.include_router(playlist.router)
 
     _shutdown_event = asyncio.Event()

@@ -225,14 +225,20 @@ def set_caption(enabled: bool) -> None:
 
 
 def _build_caption(source_url: str) -> Optional[str]:
-    """Подпись под аудио: кликабельный источник + кликабельное «via @бот»."""
+    """Подпись под аудио: источник + кликабельное «via @бот».
+
+    Для VK-ссылки на mp3 сам файл не линкуем (некрасиво) — только метку «VK».
+    """
     if not _caption_enabled or not source_url:
         return None
     label = source_label(source_url)
     if not label:
         return None
-    src = html.escape(source_url, quote=True)
-    parts = [f'🎧 <a href="{src}">{label}</a>']
+    if label == "VK":
+        parts = ["🎧 VK"]
+    else:
+        src = html.escape(source_url, quote=True)
+        parts = [f'🎧 <a href="{src}">{label}</a>']
     user = bot_username()
     if user:
         parts.append(f'<a href="https://t.me/{user}">via</a>')
@@ -770,10 +776,12 @@ async def _download_and_send(
     query: str = "",
     vk_cover_url: str = "",
     user_id: int = 0,
+    display_override: Optional[tuple[str, str]] = None,
 ) -> Optional[dict]:
     """Скачивает конкретного кандидата и отправляет в канал.
 
     Для source="vk" — прямая загрузка из VK; иначе yt-dlp (YouTube/SoundCloud).
+    display_override — форсировать (artist, title) в метаданных (напр. из альбома).
     Returns:
         {"artist", "title", "source"} при успехе, иначе None.
     """
@@ -838,8 +846,17 @@ async def _download_and_send(
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    if display_override:
+        disp_artist = (display_override[0] or disp_artist).strip() or disp_artist
+        disp_title = (display_override[1] or disp_title).strip() or disp_title
+
     send_track = Track(artist=disp_artist, title=disp_title, duration=duration)
-    redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
+    redo_query = (
+        f"{original_artist} {original_title}".strip()
+        or query
+        or f"{disp_artist} {disp_title}".strip()
+    )
+    redo_kb = _redo_keyboard(redo_query, channel_id, user_id)
     res = await sender.send_file(
         channel_id, final_mp3, send_track,
         cover=cover_path or None, reply_markup=redo_kb, caption=_build_caption(source_url),
@@ -928,6 +945,7 @@ async def _download_vk_and_send(
     hash_key: str,
     ytdlp_proxy: str = "",
     user_id: int = 0,
+    display_override: Optional[tuple[str, str]] = None,
 ) -> Optional[dict]:
     """Скачивает трек напрямую из VK (точная версия + обложка)."""
     work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
@@ -943,6 +961,9 @@ async def _download_vk_and_send(
 
     disp_artist = track.artist.strip() or "Unknown Artist"
     disp_title = track.title.strip() or "Unknown"
+    if display_override:
+        disp_artist = (display_override[0] or disp_artist).strip() or disp_artist
+        disp_title = (display_override[1] or disp_title).strip() or disp_title
     send_track = Track(artist=disp_artist, title=disp_title, duration=track.duration)
     bitrate = 0
     if track.duration:
@@ -951,7 +972,12 @@ async def _download_vk_and_send(
         except OSError:
             bitrate = 0
 
-    redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
+    redo_query = (
+        track.query
+        or f"{track.artist} {track.title}".strip()
+        or f"{disp_artist} {disp_title}".strip()
+    )
+    redo_kb = _redo_keyboard(redo_query, channel_id, user_id)
     res = await sender.send_file(
         channel_id, final_mp3, send_track,
         cover=cover_path or None, reply_markup=redo_kb, caption=_build_caption(track.url),
@@ -994,12 +1020,22 @@ async def _process_single_track(
         file_id = cached.get("telegram_file_id")
         file_path = cached.get("file_path", "")
         cover = cached.get("cover_path") or ""
+        disp_artist = cached.get("display_artist") or track.artist
+        disp_title = cached.get("display_title") or track.title
+        if track.force_meta:
+            disp_artist = track.artist or disp_artist
+            disp_title = track.title or disp_title
         send_track = Track(
-            artist=cached.get("display_artist") or track.artist,
-            title=cached.get("display_title") or track.title,
+            artist=disp_artist,
+            title=disp_title,
             duration=track.duration,
         )
-        redo_kb = _redo_keyboard(f"{send_track.artist} {send_track.title}".strip(), channel_id, user_id)
+        redo_query = (
+            track.query
+            or f"{track.artist} {track.title}".strip()
+            or f"{disp_artist} {disp_title}".strip()
+        )
+        redo_kb = _redo_keyboard(redo_query, channel_id, user_id)
         caption = _build_caption(cached.get("source_url", ""))
         if file_id:
             try:
@@ -1022,7 +1058,10 @@ async def _process_single_track(
 
     # --- VK: режим «Всё из VK» ---
     if mode == "vk" and vk_available:
-        info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id)
+        info = await _download_vk_and_send(
+            track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
+            (track.artist, track.title) if track.force_meta else None,
+        )
         if info:
             log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
             return "sent_new"
@@ -1059,6 +1098,7 @@ async def _process_single_track(
                     cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key,
                     artist_hint, track.duration, track.artist, track.title, query,
                     track.cover_url, user_id,
+                    (track.artist, track.title) if track.force_meta else None,
                 )
                 if info:
                     log.info("track_sent", source=info["source"], display=f"{info['artist']} - {info['title']}")
@@ -1066,7 +1106,10 @@ async def _process_single_track(
 
         # Fallback: ничего не нашли в uncensored-источниках → отдаём версию из VK
         if mode != "vk" and vk_available:
-            info = await _download_vk_and_send(track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id)
+            info = await _download_vk_and_send(
+                track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
+                (track.artist, track.title) if track.force_meta else None,
+            )
             if info:
                 log.info("track_sent_vk_fallback", display=f"{info['artist']} - {info['title']}")
                 return "sent_new"
