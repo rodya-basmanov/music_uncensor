@@ -50,7 +50,7 @@ def test_build_caption_links():
     cap = processor._build_caption("https://soundcloud.com/a/b")
     assert cap is not None
     assert '<a href="https://soundcloud.com/a/b">SoundCloud</a>' in cap
-    assert '<a href="https://t.me/my_bot">via @my_bot</a>' in cap
+    assert '<a href="https://t.me/my_bot">via</a>' in cap
 
 
 def test_build_caption_unknown_source():

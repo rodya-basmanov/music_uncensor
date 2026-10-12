@@ -170,7 +170,7 @@ def _build_caption(source_url: str) -> Optional[str]:
     parts = [f'🎧 <a href="{src}">{label}</a>']
     user = bot_username()
     if user:
-        parts.append(f'<a href="https://t.me/{user}">via @{user}</a>')
+        parts.append(f'<a href="https://t.me/{user}">via</a>')
     return " · ".join(parts)
 
 
