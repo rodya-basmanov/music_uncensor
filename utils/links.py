@@ -36,3 +36,14 @@ def songlink_url(source_url: str) -> Optional[str]:
     if _SC_HOST.search(source_url):
         return f"https://song.link/{source_url}"
     return None
+
+
+def source_label(source_url: str) -> str:
+    """Название источника по его URL (SoundCloud/YouTube) или пустая строка."""
+    if not source_url:
+        return ""
+    if _YT_RE.search(source_url):
+        return "YouTube"
+    if _SC_HOST.search(source_url):
+        return "SoundCloud"
+    return ""

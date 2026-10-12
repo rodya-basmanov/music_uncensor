@@ -1,6 +1,7 @@
 """Процессор плейлистов: полный цикл обработки треков."""
 
 import asyncio
+import html
 import os
 import random
 import re
@@ -36,7 +37,7 @@ from utils.helpers import (
     format_duration,
     generate_hash,
 )
-from utils.links import songlink_url
+from utils.links import source_label
 from utils.logger import get_logger
 from utils.rich import edit_rich, send_rich
 from utils.ui import is_mashup, progress_bar
@@ -159,15 +160,18 @@ def set_caption(enabled: bool) -> None:
 
 
 def _build_caption(source_url: str) -> Optional[str]:
-    """Строит подпись «🎧 song.link (<url>) · via @<bot>» (или None)."""
+    """Подпись под аудио: кликабельный источник + кликабельное «via @бот»."""
     if not _caption_enabled or not source_url:
         return None
-    sl = songlink_url(source_url)
-    if not sl:
+    label = source_label(source_url)
+    if not label:
         return None
+    src = html.escape(source_url, quote=True)
+    parts = [f'🎧 <a href="{src}">{label}</a>']
     user = bot_username()
-    via = f" · via @{user}" if user else ""
-    return f"🎧 song.link ({sl}){via}"
+    if user:
+        parts.append(f'<a href="https://t.me/{user}">via @{user}</a>')
+    return " · ".join(parts)
 
 
 def set_stats_path(path: str) -> None:

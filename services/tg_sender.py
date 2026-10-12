@@ -96,6 +96,7 @@ class TelegramSender:
             thumbnail=_cover_input(cover),
             reply_markup=reply_markup,
             caption=caption,
+            parse_mode="HTML" if caption else None,
         ))
         cover_file_id = ""
         if result.audio and result.audio.thumbnail:
@@ -114,6 +115,7 @@ class TelegramSender:
             thumbnail=_cover_input(cover),
             reply_markup=reply_markup,
             caption=caption,
+            parse_mode="HTML" if caption else None,
         ))
         file_id = result.audio.file_id if result.audio else None
         cover_file_id = ""

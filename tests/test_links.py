@@ -1,6 +1,6 @@
 """Тесты разбора ссылок: YouTube (utils/links.py) и ВК (utils/vk_link.py)."""
 
-from utils.links import find_youtube_link, songlink_url
+from utils.links import find_youtube_link, songlink_url, source_label
 from utils.vk_link import find_vk_link, parse_vk_link, parse_vk_track_link
 
 
@@ -76,3 +76,11 @@ def test_songlink_url_soundcloud_long_form():
 def test_songlink_url_other_returns_none():
     assert songlink_url("https://psv4.vkuseraudio.net/s/v1/ac/xxx") is None
     assert songlink_url("") is None
+
+
+def test_source_label():
+    assert source_label("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "YouTube"
+    assert source_label("https://youtu.be/H6tNm72cMA8") == "YouTube"
+    assert source_label("https://soundcloud.com/artist/track") == "SoundCloud"
+    assert source_label("https://psv4.vkuseraudio.net/s/v1/ac/xxx") == ""
+    assert source_label("") == ""

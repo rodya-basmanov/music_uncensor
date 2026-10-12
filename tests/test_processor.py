@@ -1,6 +1,7 @@
 """Тесты логики процессора (services/processor.py) — чистые функции."""
 
 from core.scraper.common import Candidate, DownloadResult
+from services import processor, tg_sender
 from services.processor import _effective_order, _is_junk, _resolve_display
 
 
@@ -41,3 +42,23 @@ def test_resolve_display_mashup_uses_uploader():
     artist, title = _resolve_display(dr, cand, "")
     assert artist == "wexwie"
     assert title == "FL@GMAN (widee flip) macan flagman remix"
+
+
+def test_build_caption_links():
+    processor.set_caption(True)
+    tg_sender.set_bot_username("my_bot")
+    cap = processor._build_caption("https://soundcloud.com/a/b")
+    assert cap is not None
+    assert '<a href="https://soundcloud.com/a/b">SoundCloud</a>' in cap
+    assert '<a href="https://t.me/my_bot">via @my_bot</a>' in cap
+
+
+def test_build_caption_unknown_source():
+    processor.set_caption(True)
+    assert processor._build_caption("https://psv4.vkuseraudio.net/x") is None
+
+
+def test_build_caption_disabled():
+    processor.set_caption(False)
+    assert processor._build_caption("https://soundcloud.com/a/b") is None
+    processor.set_caption(True)
