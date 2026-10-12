@@ -17,13 +17,13 @@ _LIVE_RE = re.compile(
 
 
 def version_tag(title: str) -> str:
-    """Значки версии трека для пикера: 🎬 live/концерт, 🔀 ремикс/слоу/мешап."""
+    """Значки версии трека для пикера: 🎬 live/концерт, ♻️ ремикс/слоу/мешап."""
     text = title or ""
     tag = ""
     if _LIVE_RE.search(text):
         tag += "🎬"
     if _MASHUP_RE.search(text):
-        tag += "🔀"
+        tag += "♻️"
     return tag
 
 
@@ -44,7 +44,7 @@ def is_mashup(text: str) -> bool:
 
 
 def source_icon(source: str) -> str:
-    return {"youtube": "▶️", "soundcloud": "☁️"}.get(source, "🎵")
+    return {"youtube": "▶️", "soundcloud": "☁️", "vk": ""}.get(source, "🎵")
 
 
 def fmt_duration_mmss(seconds) -> str:

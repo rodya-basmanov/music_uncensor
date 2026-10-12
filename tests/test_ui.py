@@ -21,6 +21,7 @@ def test_is_mashup():
 def test_source_icon():
     assert source_icon("youtube") == "▶️"
     assert source_icon("soundcloud") == "☁️"
+    assert source_icon("vk") == ""
     assert source_icon("unknown") == "🎵"
 
 
@@ -33,6 +34,6 @@ def test_fmt_duration_mmss():
 
 def test_version_tag():
     assert version_tag("Song (Live)") == "🎬"
-    assert version_tag("Song remix") == "🔀"
-    assert version_tag("Song (Live) remix") == "🎬🔀"
+    assert version_tag("Song remix") == "♻️"
+    assert version_tag("Song (Live) remix") == "🎬♻️"
     assert version_tag("Обычный трек") == ""

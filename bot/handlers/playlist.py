@@ -251,8 +251,8 @@ def _cleanup_picks() -> None:
         _vk_menu_pending.pop(tok, None)
 
 
-_FILTER_LABEL = {"all": "🔀 Все", "youtube": "▶️ YouTube", "soundcloud": "☁️ SoundCloud", "vk": "🇻🇰 VK"}
-_FILTER_SHORT = {"all": "🔀", "youtube": "▶️ YT", "soundcloud": "☁️ SC", "vk": "🇻🇰 VK"}
+_FILTER_LABEL = {"all": "🔀 Все", "youtube": "▶️ YouTube", "soundcloud": "☁️ SoundCloud", "vk": "VK"}
+_FILTER_SHORT = {"all": "🔀", "youtube": "▶️ YT", "soundcloud": "☁️ SC", "vk": "VK"}
 
 
 async def _search_candidates(
@@ -333,7 +333,8 @@ def _picker_keyboard(token: str, data: dict, page: int) -> InlineKeyboardMarkup:
         icon = source_icon(c.source)
         tag = version_tag(c.title)
         artist = c.artist or c.uploader or ""
-        label = f"{start + j + 1}. {icon} " + (f"{tag} " if tag else "") + c.title
+        prefix = " ".join(x for x in (icon, tag) if x)
+        label = f"{start + j + 1}. " + (f"{prefix} " if prefix else "") + c.title
         if artist:
             label += f" — {artist}"
         label += f" · {fmt_duration_mmss(c.duration)}"
@@ -341,13 +342,16 @@ def _picker_keyboard(token: str, data: dict, page: int) -> InlineKeyboardMarkup:
             label = label[:59] + "…"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"pick|{token}|{gi}")])
 
-    # фильтр источников
+    # фильтр источников (активный — зелёный)
     frow = []
     for f in _FILTERS:
         if not data["filters"].get(f):
             continue
-        mark = "• " if f == filt else ""
-        frow.append(InlineKeyboardButton(text=f"{mark}{_FILTER_SHORT[f]}", callback_data=f"pickfilter|{token}|{f}"))
+        frow.append(InlineKeyboardButton(
+            text=_FILTER_SHORT[f],
+            callback_data=f"pickfilter|{token}|{f}",
+            style="success" if f == filt else None,
+        ))
     if frow:
         rows.append(frow)
 
