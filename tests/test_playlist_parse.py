@@ -1,6 +1,6 @@
 """Тесты парсинга плейлиста в хендлере (bot/handlers/playlist.py)."""
 
-from bot.handlers.playlist import _parse_playlist
+from bot.handlers.playlist import _parse_playlist, _should_resolve_lyrics
 
 
 def test_parse_playlist_with_chat_id_and_tracks():
@@ -25,3 +25,12 @@ def test_parse_playlist_free_query_lines():
     assert len(parsed.tracks) == 2
     assert parsed.tracks[0].query == "saluki огней"
     assert parsed.tracks[1].query == "macan flagman widee flip"
+
+
+def test_should_resolve_lyrics():
+    assert _should_resolve_lyrics("первый миллион я первый чемпион") is True
+    assert _should_resolve_lyrics("детство в жопе играло") is True
+    assert _should_resolve_lyrics("macan flagman widee flip") is False
+    assert _should_resolve_lyrics("saluki огней") is False
+    assert _should_resolve_lyrics("Artist - Title") is False
+    assert _should_resolve_lyrics("https://vk.com/music/playlist/-1_2") is False

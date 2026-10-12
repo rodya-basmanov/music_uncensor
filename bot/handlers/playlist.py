@@ -7,6 +7,7 @@
   - ссылка на плейлист ВК (нужен VK_TOKEN) с выбором режима
 """
 
+import asyncio
 import os
 import tempfile
 import time
@@ -18,7 +19,8 @@ from aiogram.enums import ParseMode
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from core.cache_manager import CacheManager
-from core.scraper.common import Candidate
+from core.scraper import youtube
+from core.scraper.common import Candidate, split_artist_title
 from core.vk_fetcher import VKFetcher
 from services.processor import (
     get_redo,
@@ -38,7 +40,7 @@ from utils.links import find_youtube_link
 from utils.logger import get_logger
 from utils.rich import edit_rich
 from utils.storage import UserStorage
-from utils.ui import fmt_duration_mmss, source_icon, version_tag
+from utils.ui import fmt_duration_mmss, is_mashup, source_icon, version_tag
 from utils.vk_link import find_vk_link, parse_vk_link, parse_vk_track_link
 
 log = get_logger("playlist_handler")
@@ -63,6 +65,9 @@ _PICK_MAX = 40
 
 # Меню режима для VK-плейлиста
 _vk_menu_pending: dict[str, dict] = {}
+
+# Поиск по тексту песни: token -> {user_id, channel_id, text, songs, created}
+_lyric_pending: dict[str, dict] = {}
 
 # Сессии «Выбирать каждый трек»: user_id -> {...}
 _pick_sessions: dict[int, dict] = {}
@@ -249,6 +254,8 @@ def _cleanup_picks() -> None:
         _pending_picks.pop(tok, None)
     for tok in [t for t, v in _vk_menu_pending.items() if now - v["created"] > _PICK_TTL]:
         _vk_menu_pending.pop(tok, None)
+    for tok in [t for t, v in _lyric_pending.items() if now - v["created"] > _PICK_TTL]:
+        _lyric_pending.pop(tok, None)
 
 
 _FILTER_LABEL = {"all": "🔀 Все", "youtube": "▶️ YouTube", "soundcloud": "☁️ SoundCloud", "vk": "VK"}
@@ -395,7 +402,7 @@ async def _show_picker(message: Message, query: str, channel_id: int, user_id: i
     await _picker_flow(message.bot, message.chat.id, user_id, query, channel_id)
 
 
-async def _picker_flow(bot, chat_id: int, user_id: int, query: str, channel_id: int) -> None:
+async def _picker_flow(bot, chat_id: int, user_id: int, query: str, channel_id: int, note: str | None = None) -> None:
     """Поиск и показ пикера в указанный чат (ЛС)."""
     _cleanup_picks()
     status = await bot.send_message(chat_id, f"🔎 Ищу: <i>{esc_html(query)}</i>...", parse_mode=ParseMode.HTML)
@@ -414,7 +421,7 @@ async def _picker_flow(bot, chat_id: int, user_id: int, query: str, channel_id: 
         "user_id": user_id,
         "channel_id": channel_id,
         "query": query,
-        "title": None,
+        "title": note,
         "created": time.time(),
         "all": all_c,
         "filters": filters,
@@ -425,6 +432,106 @@ async def _picker_flow(bot, chat_id: int, user_id: int, query: str, channel_id: 
     }
     _pending_picks[token] = data
     await _render_picker(status, token, data, 0)
+
+
+def _should_resolve_lyrics(line: str) -> bool:
+    """Похоже ли на строку из текста песни (≥3 слов, не мешап, не ссылка, без тире)."""
+    line = (line or "").strip()
+    if not line or "http" in line.lower():
+        return False
+    if " - " in line or " – " in line or " — " in line:
+        return False
+    if is_mashup(line):
+        return False
+    return len(line.split()) >= 3
+
+
+async def _show_lyric_stage(message: Message, text: str, channel_id: int, user_id: int | None = None) -> None:
+    """Стадия 1: ищем по тексту в YouTube и предлагаем распознанные песни."""
+    user_id = user_id or message.from_user.id
+    if is_user_busy(user_id):
+        await message.answer("⏳ У вас уже выполняется задача. Дождитесь завершения или /cancel.")
+        return
+
+    _cleanup_picks()
+    status = await message.answer(f"🎤 Ищу по тексту: <i>{esc_html(text)}</i>...", parse_mode=ParseMode.HTML)
+    try:
+        cands = await asyncio.to_thread(youtube.search, text, 5, _ytdlp_proxy)
+    except Exception as e:
+        log.error("lyric_search_error", error=str(e))
+        cands = []
+
+    songs: list[tuple[str, str]] = []
+    seen: set = set()
+    for c in cands:
+        artist, title = split_artist_title(c.title, c.uploader)
+        artist = (artist or c.uploader or "").strip()
+        title = (title or "").strip()
+        if not title:
+            continue
+        key = (artist.lower(), title.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        songs.append((artist, title))
+
+    if not songs:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await _picker_flow(message.bot, message.chat.id, user_id, text, channel_id)
+        return
+
+    songs = songs[:5]
+    token = uuid.uuid4().hex[:8]
+    _lyric_pending[token] = {
+        "user_id": user_id,
+        "channel_id": channel_id,
+        "text": text,
+        "songs": songs,
+        "created": time.time(),
+    }
+    rows = []
+    for i, (artist, title) in enumerate(songs):
+        label = f"{artist} — {title}" if artist else title
+        if len(label) > 60:
+            label = label[:59] + "…"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"lyricpick|{token}|{i}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"pickcancel|{token}", style="danger")])
+    await status.edit_text(
+        f"🎤 <b>Похоже, это песня:</b>\n<i>{esc_html(text)}</i>\n\nВыбери трек 👇",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("lyricpick|"))
+async def cb_lyric_pick(callback: CallbackQuery):
+    """Стадия 2: пользователь подтвердил песню — ищем её по всем источникам."""
+    try:
+        _, token, idx = callback.data.split("|")
+    except ValueError:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+
+    data = _lyric_pending.pop(token, None)
+    if not data:
+        await callback.answer("⌛ Устарело — пришлите текст заново.", show_alert=True)
+        return
+    if callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш поиск.", show_alert=True)
+        return
+
+    artist, title = data["songs"][int(idx)]
+    resolved = f"{artist} {title}".strip() or data["text"]
+    note = f"🎤 по тексту → {artist} — {title}" if artist else f"🎤 по тексту → {title}"
+    await callback.answer("🔎 Ищу трек…")
+    try:
+        await callback.message.edit_text(f"🎤 <b>{esc_html(artist)} — {esc_html(title)}</b>\n🔎 Ищу...", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await _picker_flow(callback.bot, data["user_id"], data["user_id"], resolved, data["channel_id"], note=note)
 
 
 # ----------------------------- запуск задачи --------------------------------
@@ -603,7 +710,10 @@ async def handle_playlist_text(message: Message):
             return
         if not _storage.has_channel(message.from_user.id, channel_id):
             _storage.add_channel(message.from_user.id, channel_id)
-        await _show_picker(message, track_lines[0], channel_id)
+        if _should_resolve_lyrics(track_lines[0]):
+            await _show_lyric_stage(message, track_lines[0], channel_id)
+        else:
+            await _show_picker(message, track_lines[0], channel_id)
         return
 
     await _start_processing(message, raw_text, channel_hint=channel_hint)
