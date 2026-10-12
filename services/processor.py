@@ -129,9 +129,11 @@ class TaskStatus:
     not_found: int = 0
     errors: int = 0
     failed_tracks: List[str] = field(default_factory=list)
+    failed_objects: List[Track] = field(default_factory=list)
     done: bool = False
     cancelled: bool = False
     started_at: float = 0.0
+    mode: str = "uncensored"
     status_message_id: int = 0
     status_chat_id: int = 0
     current_track: str = ""
@@ -163,6 +165,26 @@ def register_redo(query: str, channel_id: int, user_id: int) -> str:
 
 def get_redo(token: str) -> Optional[dict]:
     return _redo_pending.get(token)
+
+
+# «Докачать не найденные»: token -> {tracks, channel_id, user_id, mode, created}
+_retry_pending: Dict[str, dict] = {}
+
+
+def register_retry(tracks: List[Track], channel_id: int, user_id: int, mode: str) -> str:
+    now = time.time()
+    for t in [t for t, v in _retry_pending.items() if now - v["created"] > 3600]:
+        _retry_pending.pop(t, None)
+    token = uuid.uuid4().hex[:8]
+    _retry_pending[token] = {
+        "tracks": tracks, "channel_id": channel_id, "user_id": user_id,
+        "mode": mode, "created": now,
+    }
+    return token
+
+
+def get_retry(token: str) -> Optional[dict]:
+    return _retry_pending.get(token)
 
 
 def _redo_keyboard(query: str, channel_id: int, user_id: int) -> Optional[InlineKeyboardMarkup]:
@@ -441,12 +463,26 @@ async def _edit_status(bot: Bot, status: TaskStatus, final: bool = False, force:
     if not force and now - status.last_edit < 2.0:
         return
     status.last_edit = now
+    if final:
+        markup = None
+        if status.failed_objects and not status.cancelled:
+            token = register_retry(
+                status.failed_objects, status.channel_id, status.user_id, status.mode,
+            )
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=f"🔁 Докачать не найденные ({len(status.failed_objects)})",
+                    callback_data=f"retry|{token}", style="primary",
+                ),
+            ]])
+    else:
+        markup = _status_keyboard(status.task_id)
     await edit_rich(
         bot,
         status.status_chat_id,
         status.status_message_id,
         _render_status_md(status, final=final),
-        reply_markup=None if final else _status_keyboard(status.task_id),
+        reply_markup=markup,
         fallback=_render_status(status, final=final),
     )
 
@@ -498,9 +534,11 @@ def _apply_result(status: TaskStatus, track: Track, result: str) -> None:
     elif result == "not_found":
         status.not_found += 1
         status.failed_tracks.append(_track_label(track))
+        status.failed_objects.append(track)
     else:
         status.errors += 1
         status.failed_tracks.append(f"{_track_label(track)} (ошибка)")
+        status.failed_objects.append(track)
 
 
 async def _process_tracks(
@@ -521,6 +559,7 @@ async def _process_tracks(
     source_order = source_order or ["youtube", "soundcloud"]
     status.playlist_name = playlist_name
     status.total_duration = total_duration
+    status.mode = mode
 
     try:
         # Живое статус-сообщение (само обновляется)

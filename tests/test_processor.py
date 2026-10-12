@@ -2,7 +2,14 @@
 
 from core.scraper.common import Candidate, DownloadResult
 from services import processor, tg_sender
-from services.processor import _effective_order, _is_junk, _resolve_display
+from services.processor import (
+    _effective_order,
+    _is_junk,
+    _resolve_display,
+    get_retry,
+    register_retry,
+)
+from utils.helpers import Track
 
 
 def test_is_junk():
@@ -62,3 +69,18 @@ def test_build_caption_disabled():
     processor.set_caption(False)
     assert processor._build_caption("https://soundcloud.com/a/b") is None
     processor.set_caption(True)
+
+
+def test_register_retry_roundtrip():
+    tracks = [Track(artist="A", title="B", duration=10)]
+    token = register_retry(tracks, channel_id=-100, user_id=42, mode="vk")
+    data = get_retry(token)
+    assert data is not None
+    assert data["tracks"] == tracks
+    assert data["channel_id"] == -100
+    assert data["user_id"] == 42
+    assert data["mode"] == "vk"
+
+
+def test_get_retry_unknown_token():
+    assert get_retry("nope-not-a-token") is None

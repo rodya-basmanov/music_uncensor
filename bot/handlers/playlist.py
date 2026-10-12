@@ -9,6 +9,7 @@
 
 import asyncio
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -24,6 +25,7 @@ from core.scraper.common import Candidate, split_artist_title
 from core.vk_fetcher import VKFetcher
 from services.processor import (
     get_redo,
+    get_retry,
     is_user_busy,
     process_picked_candidate,
     process_playlist,
@@ -262,6 +264,22 @@ def _cleanup_picks() -> None:
 _FILTER_LABEL = {"all": "🔀 Все", "youtube": "▶️ YouTube", "soundcloud": "☁️ SoundCloud", "vk": "VK"}
 _FILTER_SHORT = {"all": "🔀", "youtube": "▶️ YT", "soundcloud": "☁️ SC", "vk": "VK"}
 
+# «Artist — Title»: разделитель-тире между пробелами (гейт для lyric-резолва)
+_TITLE_SEP = re.compile(r"\s[-–—]\s")
+
+
+def _no_results_hint() -> str:
+    """Подсказка, почему поиск мог ничего не вернуть."""
+    if not _ytdlp_proxy:
+        return (
+            "\n\n💡 <b>YouTube/SoundCloud</b> без прокси часто недоступны "
+            "(403 / bot-check). Задайте <code>YTDLP_PROXY</code> — socks5/http."
+        )
+    return (
+        "\n\n💡 Если это YouTube — задайте <code>YTDLP_POT_PROVIDER</code> "
+        "(нужен PO-token) либо проверьте прокси."
+    )
+
 
 async def _search_candidates(
     query: str,
@@ -414,7 +432,10 @@ async def _picker_flow(bot, chat_id: int, user_id: int, query: str, channel_id: 
         all_c, filters = [], {}
 
     if not all_c:
-        await status.edit_text(f"❌ По запросу «{esc_html(query)}» ничего не найдено.", parse_mode=ParseMode.HTML)
+        await status.edit_text(
+            f"❌ По запросу «{esc_html(query)}» ничего не найдено.{_no_results_hint()}",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     token = uuid.uuid4().hex[:8]
@@ -465,6 +486,8 @@ async def _show_lyric_stage(message: Message, text: str, channel_id: int, user_i
     songs: list[tuple[str, str]] = []
     seen: set = set()
     for c in cands:
+        if not _TITLE_SEP.search(c.title or ""):
+            continue
         artist, title = split_artist_title(c.title, c.uploader)
         artist = (artist or c.uploader or "").strip()
         title = (title or "").strip()
@@ -888,7 +911,8 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
             [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"pk_skip_track|{user_id}")],
         ])
         await status.edit_text(
-            f"❌ Ничего не найдено для <b>{esc_html(track.artist)} — {esc_html(track.title)}</b>.",
+            f"❌ Ничего не найдено для <b>{esc_html(track.artist)} — {esc_html(track.title)}</b>."
+            f"{_no_results_hint()}",
             parse_mode=ParseMode.HTML, reply_markup=kb,
         )
         return
@@ -988,7 +1012,10 @@ async def cb_pick(callback: CallbackQuery):
         # даём выбрать другой — пикер оставляем, отдельно сообщаем об ошибке
         await _render_picker(callback.message, token, data, data.get("page", 0))
         try:
-            await callback.message.answer("❌ Не удалось скачать ни один вариант.")
+            await callback.message.answer(
+                f"❌ Не удалось скачать ни один вариант.{_no_results_hint()}",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
         return
@@ -1046,6 +1073,32 @@ async def cb_redo(callback: CallbackQuery):
         return
     await callback.answer()
     await _render_picker(callback.message, token, data, data.get("page", 0))
+
+
+@router.callback_query(F.data.startswith("retry|"))
+async def cb_retry(callback: CallbackQuery):
+    """Кнопка «🔁 Докачать не найденные» из финального статуса."""
+    token = callback.data.split("|", 1)[1]
+    data = get_retry(token)
+    if not data:
+        await callback.answer("⌛ Список устарел — начните заново.", show_alert=True)
+        return
+    if callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваша задача.", show_alert=True)
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("🔁 Докачиваю…")
+    await _start_processing(
+        callback.message,
+        "",
+        channel_hint=str(data["channel_id"]),
+        tracks_override=data["tracks"],
+        mode=data["mode"],
+        user_id=data["user_id"],
+    )
 
 
 @router.callback_query(F.data.startswith("next_track|"))
