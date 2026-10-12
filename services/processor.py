@@ -83,6 +83,12 @@ async def warm_vk() -> None:
         log.info("vk_warmed_up")
     except Exception as e:
         log.warning("vk_warmup_failed", error=str(e))
+        from services import health
+        await health.alert_owner(
+            f"VK-сессия не прогрелась: <code>{str(e)[:200]}</code>\n"
+            "Проверьте <code>VK_TOKEN</code>.",
+            key="vk_warmup",
+        )
 
 
 # Кэш результатов поиска: (source, query) -> (timestamp, [Candidate])
@@ -340,6 +346,11 @@ def cleanup_old_tasks(max_age_minutes: int = 30) -> int:
 def is_user_busy(user_id: int) -> bool:
     """Проверяет, есть ли у пользователя активная задача."""
     return user_id in _active_users
+
+
+def active_task_count() -> int:
+    """Сколько задач сейчас выполняется."""
+    return sum(1 for s in _tasks.values() if not s.done)
 
 
 def cancel_user_task(user_id: int) -> str | None:

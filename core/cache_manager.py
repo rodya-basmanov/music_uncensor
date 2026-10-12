@@ -111,6 +111,15 @@ class CacheManager:
         self._last_size_check = now
         return self._cached_size_gb
 
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Возвращает размер (ГБ) и число записей в кэше."""
+        files = 0
+        try:
+            files = sum(1 for f in os.listdir(self.cache_dir) if f.endswith(".json"))
+        except OSError:
+            files = 0
+        return {"size_gb": self.get_cache_size_gb(), "files": files}
+
     async def cleanup(self) -> int:
         """
         Очистка кэша: удаляет записи старше TTL или при превышении размера.

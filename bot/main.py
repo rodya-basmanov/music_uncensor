@@ -16,8 +16,10 @@ from python_socks import ProxyError
 from sentry_sdk import capture_exception
 
 from bot.handlers import cancel, link, playlist, start, stats, status
+from bot.handlers import health as health_handler
 from core.cache_manager import CacheManager
 from core.scraper.common import set_pot_provider
+from services import health as health_service
 from services import processor, tg_sender
 from utils.config import load_config
 from utils.logger import get_logger, setup_logging
@@ -75,6 +77,14 @@ async def main():
     bot = Bot(token=config.bot_token, session=session)
     dp = Dispatcher()
 
+    health_service.mark_start()
+
+    async def _send_dm(uid: int, text: str) -> bool:
+        await bot.send_message(uid, text, parse_mode="HTML")
+        return True
+
+    health_service.configure(storage.get_owner, _send_dm)
+
     @dp.error()
     async def sentry_error_handler(event):
         from aiogram.types import ErrorEvent
@@ -82,6 +92,10 @@ async def main():
             capture_exception(event.exception)
             if _log:
                 _log.error("unhandled_exception", error=str(event.exception))
+            asyncio.create_task(health_service.alert_owner(
+                f"Необработанное исключение:\n<code>{str(event.exception)[:300]}</code>",
+                key="unhandled",
+            ))
 
     start.set_storage(storage)
     link.set_storage(storage)
@@ -105,6 +119,11 @@ async def main():
         source_order=config.source_order, ytdlp_proxy=config.ytdlp_proxy, vk_token=config.vk_token,
         vk_playlist_mode=config.vk_playlist_mode, concurrency=config.concurrency,
     )
+    health_handler.set_dependencies(
+        cache_mgr=cache_mgr, storage=storage,
+        ytdlp_proxy=config.ytdlp_proxy, pot_provider=config.ytdlp_pot_provider,
+        vk_token=config.vk_token,
+    )
 
     try:
         await bot.set_my_commands([
@@ -115,6 +134,7 @@ async def main():
             BotCommand(command="unlink", description="Отвязать канал"),
             BotCommand(command="status", description="Статус задачи"),
             BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="health", description="Состояние бота"),
             BotCommand(command="cancel", description="Отменить задачу"),
         ])
         _log.info("commands_registered")
@@ -126,6 +146,7 @@ async def main():
     dp.include_router(status.router)
     dp.include_router(cancel.router)
     dp.include_router(stats.router)
+    dp.include_router(health_handler.router)
     dp.include_router(playlist.router)
 
     _shutdown_event = asyncio.Event()
@@ -157,6 +178,16 @@ async def main():
                 _log.error("cache_cleanup_error", error=str(e))
 
     cleanup_task = asyncio.create_task(cache_cleanup_loop())
+
+    async def heartbeat_loop():
+        while not (_shutdown_event and _shutdown_event.is_set()):
+            health_service.beat()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
+
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
 
     if config.webhook_mode and config.webhook_url:
         _log.info("starting_webhook", url=config.webhook_url)
@@ -203,8 +234,13 @@ async def main():
                     retry_delay = min(retry_delay * 2, max_retry_delay)
         finally:
             cleanup_task.cancel()
+            heartbeat_task.cancel()
             try:
                 await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await heartbeat_task
             except asyncio.CancelledError:
                 pass
             await _shutdown("polling_exit", cache_mgr, bot)

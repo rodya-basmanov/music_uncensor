@@ -195,6 +195,7 @@ YTDLP_POT_PROVIDER=http://127.0.0.1:4416
 | `/unlink -100XXX` | Отвязать канал |
 | `/status <id>` | Статус задачи |
 | `/stats` | Статистика |
+| `/health` | Состояние бота (аптайм, heartbeat, задачи, кэш) — для владельца |
 | `/cancel` | Отменить текущую задачу |
 
 ## 🔎 Как работает
@@ -243,6 +244,7 @@ vk_music/
 │       ├── playlist.py         # плейлисты/ссылки/пикер/VK-режимы
 │       ├── status.py           # /status
 │       ├── cancel.py           # /cancel
+│       ├── health.py           # /health
 │       └── stats.py            # /stats
 ├── core/
 │   ├── cover.py                # загрузка обложек (aiohttp/socks)
@@ -254,6 +256,7 @@ vk_music/
 │       └── soundcloud.py       # источник SoundCloud (scsearch)
 ├── services/
 │   ├── processor.py            # оркестрация: поиск → скачивание → отправка
+│   ├── health.py               # heartbeat + алерты владельцу
 │   └── tg_sender.py            # отправка аудио + троттлинг/FloodWait
 ├── utils/
 │   ├── config.py  helpers.py  logger.py  storage.py  ui.py  rich.py

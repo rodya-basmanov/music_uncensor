@@ -105,3 +105,14 @@ class UserStorage:
             data[uid]["tasks_done"] = data[uid].get("tasks_done", 0) + 1
             data[uid]["last_active"] = int(time.time())
             self._write(data)
+
+    def get_owner(self) -> Optional[int]:
+        """Владелец — первый пользователь, привязавший канал."""
+        data = self._read()
+        for uid, info in data.items():
+            if info.get("channels"):
+                try:
+                    return int(uid)
+                except (TypeError, ValueError):
+                    continue
+        return None
