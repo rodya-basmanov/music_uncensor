@@ -838,11 +838,36 @@ async def cb_pick(callback: CallbackQuery):
         vk_cover_url=data.get("vk_cover_url", ""),
     )
 
+    # авто-фолбэк: если выбранный вариант не скачался — пробуем другие (другой источник первым)
+    if not info:
+        alternatives = [c for c in data["all"] if c.url != cand.url]
+        alternatives.sort(key=lambda c: (c.source == cand.source,))
+        for alt in alternatives[:3]:
+            try:
+                await callback.message.edit_text(
+                    f"⏳ Не вышло, пробую {source_icon(alt.source)} <b>{esc_html(alt.title[:50])}</b>...",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            info = await process_picked_candidate(
+                user_id=data["user_id"],
+                channel_id=data["channel_id"],
+                cand=alt,
+                bot=callback.message.bot,
+                cache_mgr=_cache_mgr,
+                ytdlp_proxy=_ytdlp_proxy,
+                query=data["query"],
+                vk_cover_url=data.get("vk_cover_url", ""),
+            )
+            if info:
+                break
+
     if not info:
         # даём выбрать другой — пикер оставляем, отдельно сообщаем об ошибке
         await _render_picker(callback.message, token, data, data.get("page", 0))
         try:
-            await callback.message.answer("❌ Не удалось скачать этот трек. Попробуйте другой вариант.")
+            await callback.message.answer("❌ Не удалось скачать ни один вариант.")
         except Exception:
             pass
         return

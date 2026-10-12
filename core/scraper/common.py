@@ -13,6 +13,22 @@ from utils.logger import get_logger
 
 log = get_logger("source_common")
 
+# URL провайдера PO-токенов (bgutil-ytdlp-pot-provider) для обхода
+# «Sign in to confirm you're not a bot» на YouTube. Пусто — выключено.
+_pot_provider_url = ""
+
+
+def set_pot_provider(url: str) -> None:
+    """Задаёт base_url HTTP-провайдера PO-токенов (пусто — выключить)."""
+    global _pot_provider_url
+    _pot_provider_url = (url or "").strip()
+
+
+def _pot_args() -> List[str]:
+    if _pot_provider_url:
+        return ["--extractor-args", f"youtubepot-bgutilhttp:base_url={_pot_provider_url}"]
+    return []
+
 
 @dataclass
 class Candidate:
@@ -139,7 +155,7 @@ def rank_candidates(
 
 def run_ytdlp(args: List[str], timeout: int = 120) -> subprocess.CompletedProcess:
     """Запускает yt-dlp с базовыми флагами."""
-    cmd = ["yt-dlp", "--no-warnings", "--no-update"] + args
+    cmd = ["yt-dlp", "--no-warnings", "--no-update"] + _pot_args() + args
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="ignore")
 
 

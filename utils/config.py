@@ -24,6 +24,7 @@ class Config:
     vk_token: str = ""
     vk_playlist_mode: str = "ask"
     ytdlp_proxy: str = ""
+    ytdlp_pot_provider: str = ""
     source_order: list[str] = field(default_factory=lambda: ["youtube", "soundcloud"])
 
     # Paths
@@ -78,6 +79,7 @@ def load_config() -> Config:
         vk_token=os.getenv("VK_TOKEN", ""),
         vk_playlist_mode=os.getenv("VK_PLAYLIST_MODE", "ask").strip().lower() or "ask",
         ytdlp_proxy=os.getenv("YTDLP_PROXY", "") or telegram_proxy,
+        ytdlp_pot_provider=os.getenv("YTDLP_POT_PROVIDER", ""),
         source_order=source_order or ["youtube", "soundcloud"],
 
         max_playlist_size=int(os.getenv("MAX_PLAYLIST_SIZE", "500")),

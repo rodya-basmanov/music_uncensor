@@ -98,6 +98,21 @@ docker run -d --name vk_music_bot --env-file .env \
 > Пакет в GHCR по умолчанию приватный — сделайте его публичным в настройках пакета
 > GitHub или выполните `docker login ghcr.io`.
 
+## 🎬 YouTube: «Sign in to confirm you're not a bot»
+
+YouTube иногда требует авторизацию **для скачивания** (поиск при этом работает).
+Решение — провайдер PO-токенов **bgutil-ytdlp-pot-provider**:
+
+```bash
+# локально (Docker):
+docker run -d -p 4416:4416 --name bgutil brainicism/bgutil-ytdlp-pot-provider
+# затем в .env:
+YTDLP_POT_PROVIDER=http://127.0.0.1:4416
+```
+
+В `docker compose` провайдер поднимается автоматически (сервис `pot-provider`),
+переменная уже задана. Провайдеру нужен доступ к YouTube (в РФ — через прокси).
+
 ## ⚙️ Конфигурация (`.env`)
 
 | Переменная | По умолчанию | Описание |
@@ -108,6 +123,7 @@ docker run -d --name vk_music_bot --env-file .env \
 | `VK_PLAYLIST_MODE` | `ask` | `ask` / `uncensored` / `vk` — поведение для VK-плейлистов |
 | `SOURCE_ORDER` | `youtube,soundcloud` | Порядок источников поиска |
 | `YTDLP_PROXY` | = `TELEGRAM_PROXY_URL` | Прокси для yt-dlp (YouTube) |
+| `YTDLP_POT_PROVIDER` | — | base_url провайдера PO-токенов для YouTube (bgutil) |
 | `DATA_DIR` | `./data` | Папка данных (users.json) |
 | `MAX_PLAYLIST_SIZE` | `500` | Максимум треков в плейлисте |
 | `CONCURRENCY` | `3` | Сколько треков обрабатывать параллельно (1 — по порядку) |
@@ -244,6 +260,7 @@ vk_music/
 | Бот не запускается | Проверьте `BOT_TOKEN` в `.env` |
 | Telegram недоступен | Нужен SOCKS5/HTTP прокси в `TELEGRAM_PROXY_URL` (не MTProto) |
 | YouTube не качается (403) | Обновите `yt-dlp` и задайте `YTDLP_PROXY` |
+| YouTube «Sign in to confirm you're not a bot» | Поднимите PO-провайдер (bgutil) и задайте `YTDLP_POT_PROVIDER` |
 | Канал не привязывается | Бот должен быть админом канала |
 | FloodWait при отправке | Увеличьте `SEND_INTERVAL` |
 | Нужен плейлист из Яндекс.Музыки/Spotify | Перенесите его в ВК приложением <https://vk.ru/app8116845> и пришлите VK-ссылку |

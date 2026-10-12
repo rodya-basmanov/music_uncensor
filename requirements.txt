@@ -5,6 +5,7 @@ python-dotenv>=1.0
 structlog>=24.0
 tinytag>=1.10
 yt-dlp>=2026.8.19
+bgutil-ytdlp-pot-provider
 imageio-ffmpeg>=0.4.0
 rapidfuzz>=3.0
 vk-api>=11.9

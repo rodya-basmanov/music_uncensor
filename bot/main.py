@@ -17,6 +17,7 @@ from sentry_sdk import capture_exception
 
 from bot.handlers import cancel, link, playlist, start, stats, status
 from core.cache_manager import CacheManager
+from core.scraper.common import set_pot_provider
 from services import processor, tg_sender
 from utils.config import load_config
 from utils.logger import get_logger, setup_logging
@@ -88,6 +89,9 @@ async def main():
     processor.set_stats_path(os.path.join(config.data_dir, "stats.json"))
     processor.set_caption(config.audio_caption)
     tg_sender.set_send_interval(config.send_interval)
+    set_pot_provider(config.ytdlp_pot_provider)
+    if config.ytdlp_pot_provider:
+        _log.info("pot_provider_enabled", url=config.ytdlp_pot_provider)
     try:
         me = await bot.me()
         tg_sender.set_bot_username(config.via_username or (me.username or ""))

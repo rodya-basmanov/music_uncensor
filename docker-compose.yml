@@ -3,6 +3,18 @@ services:
     build: .
     container_name: vk_music_bot
     env_file: .env
+    environment:
+      # Провайдер PO-токенов (bgutil) внутри compose-сети
+      YTDLP_POT_PROVIDER: http://pot-provider:4416
     volumes:
       - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - pot-provider
+
+  # Генерация PO-токенов для YouTube (обход «Sign in to confirm you're not a bot»).
+  # Если не нужен — удалите сервис и переменную YTDLP_POT_PROVIDER.
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: vk_music_pot
     restart: unless-stopped
