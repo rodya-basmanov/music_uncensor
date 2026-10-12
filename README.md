@@ -254,4 +254,4 @@ CI (GitHub Actions) прогоняет их на Python 3.11 и 3.12 при ка
 
 ## 📜 Лицензия
 
-MIT — используйте свободно.
+MIT — см. [LICENSE](LICENSE).
