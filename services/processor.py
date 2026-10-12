@@ -74,6 +74,41 @@ def _vk_search(query: str, count: int = 5, proxy: str = "") -> list:
     return _vk_fetcher.search(query, count)
 
 
+async def warm_vk() -> None:
+    """Прогрев VK-сессии на старте (чтобы первый поиск не ждал ~14с)."""
+    if not _vk_fetcher:
+        return
+    try:
+        await asyncio.to_thread(_vk_fetcher.search, "music", 1)
+        log.info("vk_warmed_up")
+    except Exception as e:
+        log.warning("vk_warmup_failed", error=str(e))
+
+
+# Кэш результатов поиска: (source, query) -> (timestamp, [Candidate])
+_SEARCH_CACHE_TTL = 600
+_SEARCH_CACHE_MAX = 300
+_search_cache: Dict[tuple, tuple] = {}
+
+
+def _cache_key(source: str, query: str) -> tuple:
+    return (source, " ".join((query or "").lower().split()))
+
+
+def _cache_get(source: str, query: str):
+    item = _search_cache.get(_cache_key(source, query))
+    if item and time.time() - item[0] < _SEARCH_CACHE_TTL:
+        return item[1]
+    return None
+
+
+def _cache_put(source: str, query: str, candidates: list) -> None:
+    if len(_search_cache) >= _SEARCH_CACHE_MAX:
+        for k, _ in sorted(_search_cache.items(), key=lambda kv: kv[1][0])[:50]:
+            _search_cache.pop(k, None)
+    _search_cache[_cache_key(source, query)] = (time.time(), candidates)
+
+
 def _provider(name: str):
     """Возвращает функцию поиска по имени источника."""
     if name == "vk":
@@ -300,6 +335,18 @@ def cancel_user_task(user_id: int) -> str | None:
     return None
 
 
+def cancel_task(task_id: str) -> bool:
+    """Отменяет задачу по её ID. Returns True если отменили."""
+    status = _tasks.get(task_id)
+    if not status or status.done:
+        return False
+    status.done = True
+    status.cancelled = True
+    _active_users.discard(status.user_id)
+    log.info("task_cancelled_by_id", task_id=task_id)
+    return True
+
+
 async def process_playlist(
     user_id: int,
     channel_id: int,
@@ -339,7 +386,8 @@ async def process_playlist(
 
 def _status_keyboard(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}", style="primary")
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_{task_id}", style="primary"),
+        InlineKeyboardButton(text="⏹ Отменить", callback_data=f"cancel_task|{task_id}", style="danger"),
     ]])
 
 
@@ -680,6 +728,7 @@ async def _download_and_send(
         {"artist", "title", "source"} при успехе, иначе None.
     """
     work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
+    bitrate = 0
     try:
         if cand.source == "vk":
             final_mp3, cover_path = await _download_vk_media(
@@ -692,6 +741,11 @@ async def _download_and_send(
             disp_title = (cand.title or "Unknown").strip()
             duration = int(cand.duration) or duration_hint
             source_url = cand.url
+            if duration:
+                try:
+                    bitrate = int(os.path.getsize(final_mp3) * 8 / duration / 1000)
+                except OSError:
+                    bitrate = 0
         else:
             dr = await asyncio.to_thread(
                 download_audio, cand.url, work_dir, "audio", ytdlp_proxy, cand.source,
@@ -710,6 +764,7 @@ async def _download_and_send(
             disp_artist, disp_title = _resolve_display(dr, cand, artist_hint)
             duration = dr.duration or duration_hint
             source_url = dr.source_url
+            bitrate = dr.bitrate
 
             cover_path = ""
             final_cover = cache_mgr._cover_path(hash_key)
@@ -755,7 +810,7 @@ async def _download_and_send(
         "downloaded_at": int(time.time()),
     })
     _bump(total_sent=1)
-    return {"artist": disp_artist, "title": disp_title, "source": cand.source}
+    return {"artist": disp_artist, "title": disp_title, "source": cand.source, "bitrate": bitrate}
 
 
 async def search_all(
@@ -770,11 +825,14 @@ async def search_all(
         searcher = _provider(src)
         if not searcher:
             return []
-        try:
-            cands = await asyncio.to_thread(searcher, query, per_source, ytdlp_proxy)
-        except Exception as e:
-            log.warning("search_error", source=src, query=query, error=str(e))
-            cands = []
+        cands = _cache_get(src, query)
+        if cands is None:
+            try:
+                cands = await asyncio.to_thread(searcher, query, per_source, ytdlp_proxy)
+            except Exception as e:
+                log.warning("search_error", source=src, query=query, error=str(e))
+                cands = []
+            _cache_put(src, query, cands)
         return rank_candidates(cands, query, 0, "", limit=per_source)
 
     groups = await asyncio.gather(*(one(s) for s in source_order))
@@ -836,6 +894,12 @@ async def _download_vk_and_send(
     disp_artist = track.artist.strip() or "Unknown Artist"
     disp_title = track.title.strip() or "Unknown"
     send_track = Track(artist=disp_artist, title=disp_title, duration=track.duration)
+    bitrate = 0
+    if track.duration:
+        try:
+            bitrate = int(os.path.getsize(final_mp3) * 8 / track.duration / 1000)
+        except OSError:
+            bitrate = 0
 
     redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
     res = await sender.send_file(
@@ -857,7 +921,7 @@ async def _download_vk_and_send(
         "downloaded_at": int(time.time()),
     })
     _bump(total_sent=1)
-    return {"artist": disp_artist, "title": disp_title, "source": "vk"}
+    return {"artist": disp_artist, "title": disp_title, "source": "vk", "bitrate": bitrate}
 
 
 async def _process_single_track(

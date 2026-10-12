@@ -93,6 +93,7 @@ async def main():
     set_pot_provider(config.ytdlp_pot_provider)
     if config.ytdlp_pot_provider:
         _log.info("pot_provider_enabled", url=config.ytdlp_pot_provider)
+    asyncio.create_task(processor.warm_vk())
     try:
         me = await bot.me()
         tg_sender.set_bot_username(config.via_username or (me.username or ""))

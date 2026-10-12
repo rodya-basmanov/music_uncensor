@@ -208,8 +208,9 @@ async def _send_direct(message: Message, cand: Candidate, label: str, user_id: i
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔁 Найти варианты", callback_data=f"reopen|{token}"),
     ]])
+    kbps = f" · {info['bitrate']} kbps" if info.get("bitrate") else ""
     await status.edit_text(
-        f"✅ Отправлено в канал:\n<b>{esc_html(info['artist'])} — {esc_html(info['title'])}</b>",
+        f"✅ Отправлено в канал:\n<b>{esc_html(info['artist'])} — {esc_html(info['title'])}</b>{kbps}",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -992,7 +993,8 @@ async def cb_pick(callback: CallbackQuery):
             pass
         return
 
-    success_text = f"✅ Отправлено в канал:\n<b>{esc_html(info['artist'])} — {esc_html(info['title'])}</b>"
+    kbps = f" · {info['bitrate']} kbps" if info.get("bitrate") else ""
+    success_text = f"✅ Отправлено в канал:\n<b>{esc_html(info['artist'])} — {esc_html(info['title'])}</b>{kbps}"
 
     if data.get("pk_session") is not None:
         session = _pick_sessions.get(data["pk_session"])
