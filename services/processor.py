@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from rapidfuzz import fuzz
 
 from core.cache_manager import CacheManager
 from core.cover import download_image
@@ -22,6 +23,7 @@ from core.scraper.common import (
     Candidate,
     DownloadResult,
     download_audio,
+    normalize,
     rank_candidates,
     score_candidate,
     split_artist_title,
@@ -172,6 +174,43 @@ def _build_caption(source_url: str) -> Optional[str]:
     if user:
         parts.append(f'<a href="https://t.me/{user}">via</a>')
     return " · ".join(parts)
+
+
+# Минимальный fuzzy-скор для использования VK-обложки (иначе — обложка источника)
+_vk_cover_min_score: float = 90.0
+
+
+def set_vk_cover_min_score(score: float) -> None:
+    global _vk_cover_min_score
+    try:
+        _vk_cover_min_score = float(score)
+    except (TypeError, ValueError):
+        _vk_cover_min_score = 90.0
+
+
+def _fetch_vk_cover(artist: str, title: str) -> str:
+    """Ищет обложку в VK; возвращает URL только при хорошем совпадении (иначе пусто)."""
+    if not _vk_fetcher or not (artist or title):
+        return ""
+    query = f"{artist} {title}".strip()
+    try:
+        cands = _vk_fetcher.search(query, 3)
+    except Exception:
+        return ""
+    best_url = ""
+    best_score = 0.0
+    for c in cands:
+        if not c.cover_url:
+            continue
+        title_score = fuzz.token_set_ratio(normalize(title), normalize(c.title))
+        artist_score = fuzz.token_set_ratio(normalize(artist), normalize(c.artist or c.uploader))
+        score = 0.6 * title_score + 0.4 * artist_score
+        if score > best_score:
+            best_score, best_url = score, c.cover_url
+    if best_url and best_score >= _vk_cover_min_score:
+        log.info("vk_cover_found", score=round(best_score, 1))
+        return best_url
+    return ""
 
 
 def set_stats_path(path: str) -> None:
@@ -676,10 +715,11 @@ async def _download_and_send(
             final_cover = cache_mgr._cover_path(hash_key)
             got_cover = False
             cover_origin = "none"
-            # 1. Обложка из VK-плейлиста (приоритет)
-            if vk_cover_url:
+            # 1. VK-обложка: из плейлиста или найденная в VK при хорошем совпадении
+            vk_cover = vk_cover_url or await asyncio.to_thread(_fetch_vk_cover, disp_artist, disp_title)
+            if vk_cover:
                 raw_vk = os.path.join(work_dir, "cover_vk")
-                if await download_image(vk_cover_url, raw_vk, ""):
+                if await download_image(vk_cover, raw_vk, ""):
                     if make_thumbnail(raw_vk, final_cover):
                         cover_path = final_cover
                         got_cover = True
@@ -724,20 +764,21 @@ async def search_all(
     ytdlp_proxy: str = "",
     per_source: int = 5,
 ) -> List[Candidate]:
-    """Ищет во всех источниках и возвращает объединённый список кандидатов."""
-    results: List[Candidate] = []
-    for src in source_order:
+    """Ищет во всех источниках параллельно, возвращает объединённый список."""
+
+    async def one(src: str) -> List[Candidate]:
         searcher = _provider(src)
         if not searcher:
-            continue
+            return []
         try:
             cands = await asyncio.to_thread(searcher, query, per_source, ytdlp_proxy)
         except Exception as e:
             log.warning("search_error", source=src, query=query, error=str(e))
             cands = []
-        for c in rank_candidates(cands, query, 0, "", limit=per_source):
-            results.append(c)
-    return results
+        return rank_candidates(cands, query, 0, "", limit=per_source)
+
+    groups = await asyncio.gather(*(one(s) for s in source_order))
+    return [c for group in groups for c in group]
 
 
 def _effective_order(source_order: List[str], is_query: bool) -> List[str]:

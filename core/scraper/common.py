@@ -54,6 +54,7 @@ class DownloadResult:
     source_url: str = ""
     source: str = ""
     thumbnail_url: str = ""
+    bitrate: int = 0
 
 
 _REMIX_KEYWORDS = ["slowed", "reverb", "sped up", "pitched", "bootleg", "mashup"]
@@ -212,7 +213,7 @@ def download_audio(
         "--paths", dest_dir,
         "--output", out_tmpl,
         "--no-simulate",
-        "--print", "META|||%(artist,uploader)s|||%(track,title)s|||%(duration)s|||%(thumbnail)s|||%(webpage_url)s",
+        "--print", "META|||%(artist,uploader)s|||%(track,title)s|||%(duration)s|||%(thumbnail)s|||%(webpage_url)s|||%(abr)s",
     ]
     if embed_thumb:
         args += ["--embed-thumbnail", "--convert-thumbnails", "jpg", "--embed-metadata", "--write-thumbnail"]
@@ -245,6 +246,7 @@ def download_audio(
     # метаданные
     artist = title = ""
     duration = 0
+    bitrate = 0
     thumb_url = ""
     source_url = url
     for line in (result.stdout or "").splitlines():
@@ -261,6 +263,11 @@ def download_audio(
                     duration = 0
                 thumb_url = "" if parts[4].strip() in ("NA", "None") else parts[4].strip()
                 source_url = parts[5].strip() or url
+                if len(parts) >= 7:
+                    try:
+                        bitrate = int(float(parts[6]))
+                    except (ValueError, TypeError):
+                        bitrate = 0
             break
 
     # обложка: ищем файл с нашим стемом (jpg/png/webp)
@@ -271,6 +278,8 @@ def download_audio(
                 cover_path = os.path.join(dest_dir, f)
                 break
 
+    log.info("download_meta", source=source, abr=bitrate, size_mb=round(os.path.getsize(final_mp3) / 1024 / 1024, 2))
+
     return DownloadResult(
         file_path=final_mp3,
         cover_path=cover_path,
@@ -280,4 +289,5 @@ def download_audio(
         source_url=source_url,
         source=source,
         thumbnail_url=thumb_url,
+        bitrate=bitrate,
     )

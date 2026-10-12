@@ -257,29 +257,35 @@ _FILTER_SHORT = {"all": "🔀", "youtube": "▶️ YT", "soundcloud": "☁️ SC
 
 async def _search_candidates(
     query: str,
-    extra_vk: Candidate | None = None,
-    per_source: int = 8,
+    extra_exact: Candidate | None = None,
+    per_source: int = 5,
     sources: list[str] | None = None,
 ):
     """Ищет в источниках. Возвращает (all, filters).
 
-    `extra_vk` — точный VK-трек (напр. из плейлиста), показывается в VK-вкладке
+    `extra_exact` — точный VK-трек (напр. из плейлиста), показывается в VK-вкладке
     без поиска по VK. Если `sources` не задан — ищем SC+YT+VK.
     """
     sources = sources if sources is not None else ["soundcloud", "youtube", "vk"]
     results = await search_all(query, sources, _ytdlp_proxy, per_source=per_source)
     all_c: list[Candidate] = []
     filters: dict[str, list[int]] = {"youtube": [], "soundcloud": [], "vk": []}
+    first_idx: dict[str, int] = {}
 
     def add(c: Candidate):
-        filters.setdefault(c.source, []).append(len(all_c))
+        gi = len(all_c)
+        filters.setdefault(c.source, []).append(gi)
+        first_idx.setdefault(c.source, gi)
         all_c.append(c)
 
     for c in results:
         add(c)
-    if extra_vk is not None and extra_vk.url:
-        add(extra_vk)
-    filters["all"] = list(range(len(all_c)))
+    if extra_exact is not None and extra_exact.url:
+        add(extra_exact)
+
+    # «Все» = лучший (первый) кандидат каждой платформы, в порядке появления
+    order = list(dict.fromkeys(c.source for c in all_c))
+    filters["all"] = [first_idx[s] for s in order]
     return all_c[:_PICK_MAX], {k: [i for i in v if i < _PICK_MAX] for k, v in filters.items()}
 
 
@@ -743,11 +749,11 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
     track = tracks[i]
     query = f"{clean_artist_for_search(track.artist)} {clean_title_for_search(track.title)}".strip() \
         or track.title or "Unknown"
-    extra_vk = None
+    extra_exact = None
     if track.url:
-        extra_vk = Candidate(url=track.url, title=track.title, artist=track.artist,
-                             uploader=track.artist, duration=track.duration or 0,
-                             cover_url=track.cover_url, source="vk")
+        extra_exact = Candidate(url=track.url, title=track.title, artist=track.artist,
+                                uploader=track.artist, duration=track.duration or 0,
+                                cover_url=track.cover_url, source="vk")
 
     status = await base_message.answer(
         f"🎛 Трек {i + 1}/{len(tracks)}: <b>{esc_html(track.artist)} — {esc_html(track.title)}</b>\n🔎 Ищу...",
@@ -756,7 +762,7 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
     try:
         # VK-вкладка = точный трек из плейлиста (без поиска по VK)
         all_c, filters = await _search_candidates(
-            query, extra_vk=extra_vk, sources=["soundcloud", "youtube"],
+            query, extra_exact=extra_exact, sources=["soundcloud", "youtube"],
         )
     except Exception as e:
         log.error("vk_choose_search_error", error=str(e))

@@ -39,6 +39,9 @@ class Config:
     audio_caption: bool = True
     via_username: str = ""
 
+    # Обложки: минимальный fuzzy-скор для VK-обложки (иначе — обложка источника)
+    vk_cover_min_score: int = 90
+
     # Cache
     cache_dir: str = "./data/cache"
     cache_ttl_days: int = 7
@@ -87,6 +90,7 @@ def load_config() -> Config:
         send_interval=max(0.0, float(os.getenv("SEND_INTERVAL", "3"))),
         audio_caption=_env_bool("AUDIO_CAPTION", True),
         via_username=os.getenv("VIA_USERNAME", ""),
+        vk_cover_min_score=int(os.getenv("VK_COVER_MIN_SCORE", "90")),
         cache_dir=os.getenv("CACHE_DIR", "./data/cache"),
         cache_ttl_days=int(os.getenv("CACHE_TTL_DAYS", "7")),
         max_cache_size_gb=int(os.getenv("MAX_CACHE_SIZE_GB", "20")),
