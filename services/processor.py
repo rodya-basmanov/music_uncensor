@@ -25,7 +25,7 @@ from core.scraper.common import (
     score_candidate,
     split_artist_title,
 )
-from services.tg_sender import TelegramSender
+from services.tg_sender import TelegramSender, bot_username
 from utils.escape import esc_html, esc_md
 from utils.ffmpeg import make_thumbnail
 from utils.helpers import (
@@ -36,6 +36,7 @@ from utils.helpers import (
     format_duration,
     generate_hash,
 )
+from utils.links import songlink_url
 from utils.logger import get_logger
 from utils.rich import edit_rich, send_rich
 from utils.ui import is_mashup, progress_bar
@@ -147,6 +148,26 @@ _stats = {
 
 _stats_path: str = ""
 _last_stats_save: float = 0.0
+
+# Подпись под аудио (song.link + via @bot)
+_caption_enabled: bool = True
+
+
+def set_caption(enabled: bool) -> None:
+    global _caption_enabled
+    _caption_enabled = bool(enabled)
+
+
+def _build_caption(source_url: str) -> Optional[str]:
+    """Строит подпись «🎧 song.link (<url>) · via @<bot>» (или None)."""
+    if not _caption_enabled or not source_url:
+        return None
+    sl = songlink_url(source_url)
+    if not sl:
+        return None
+    user = bot_username()
+    via = f" · via @{user}" if user else ""
+    return f"🎧 song.link ({sl}){via}"
 
 
 def set_stats_path(path: str) -> None:
@@ -670,7 +691,10 @@ async def _download_and_send(
 
     send_track = Track(artist=disp_artist, title=disp_title, duration=duration)
     redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
-    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None, reply_markup=redo_kb)
+    res = await sender.send_file(
+        channel_id, final_mp3, send_track,
+        cover=cover_path or None, reply_markup=redo_kb, caption=_build_caption(source_url),
+    )
 
     cache_mgr.save(hash_key, {
         "artist": original_artist or query,
@@ -769,7 +793,10 @@ async def _download_vk_and_send(
     send_track = Track(artist=disp_artist, title=disp_title, duration=track.duration)
 
     redo_kb = _redo_keyboard(f"{disp_artist} {disp_title}".strip(), channel_id, user_id)
-    res = await sender.send_file(channel_id, final_mp3, send_track, cover=cover_path or None, reply_markup=redo_kb)
+    res = await sender.send_file(
+        channel_id, final_mp3, send_track,
+        cover=cover_path or None, reply_markup=redo_kb, caption=_build_caption(track.url),
+    )
     cache_mgr.save(hash_key, {
         "artist": track.artist,
         "title": track.title,
@@ -814,9 +841,10 @@ async def _process_single_track(
             duration=track.duration,
         )
         redo_kb = _redo_keyboard(f"{send_track.artist} {send_track.title}".strip(), channel_id, user_id)
+        caption = _build_caption(cached.get("source_url", ""))
         if file_id:
             try:
-                res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover, reply_markup=redo_kb)
+                res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover, reply_markup=redo_kb, caption=caption)
                 if res.get("cover_file_id") and not cached.get("cover_file_id"):
                     cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
                 cache_mgr.update_access(hash_key)
@@ -825,7 +853,7 @@ async def _process_single_track(
             except Exception:
                 pass
         if file_path and os.path.exists(file_path):
-            res = await sender.send_file(channel_id, file_path, send_track, cover=cover, reply_markup=redo_kb)
+            res = await sender.send_file(channel_id, file_path, send_track, cover=cover, reply_markup=redo_kb, caption=caption)
             if res.get("file_id"):
                 cache_mgr.save_file_id(hash_key, res["file_id"])
             if res.get("cover_file_id"):

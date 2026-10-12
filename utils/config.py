@@ -34,6 +34,10 @@ class Config:
     concurrency: int = 3
     send_interval: float = 3.0
 
+    # Audio caption (song.link + via @bot)
+    audio_caption: bool = True
+    via_username: str = ""
+
     # Cache
     cache_dir: str = "./data/cache"
     cache_ttl_days: int = 7
@@ -79,6 +83,8 @@ def load_config() -> Config:
         max_playlist_size=int(os.getenv("MAX_PLAYLIST_SIZE", "500")),
         concurrency=max(1, int(os.getenv("CONCURRENCY", "3"))),
         send_interval=max(0.0, float(os.getenv("SEND_INTERVAL", "3"))),
+        audio_caption=_env_bool("AUDIO_CAPTION", True),
+        via_username=os.getenv("VIA_USERNAME", ""),
         cache_dir=os.getenv("CACHE_DIR", "./data/cache"),
         cache_ttl_days=int(os.getenv("CACHE_TTL_DAYS", "7")),
         max_cache_size_gb=int(os.getenv("MAX_CACHE_SIZE_GB", "20")),

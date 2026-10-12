@@ -1,6 +1,6 @@
 """Тесты разбора ссылок: YouTube (utils/links.py) и ВК (utils/vk_link.py)."""
 
-from utils.links import find_youtube_link
+from utils.links import find_youtube_link, songlink_url
 from utils.vk_link import find_vk_link, parse_vk_link, parse_vk_track_link
 
 
@@ -61,3 +61,18 @@ def test_parse_vk_track_mobile():
 
 def test_playlist_parser_ignores_track_link():
     assert parse_vk_link("https://vk.com/audio-2001046443_123456_abc123") is None
+
+
+def test_songlink_url_youtube():
+    assert songlink_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "https://song.link/y/dQw4w9WgXcQ"
+    assert songlink_url("https://youtu.be/H6tNm72cMA8") == "https://song.link/y/H6tNm72cMA8"
+
+
+def test_songlink_url_soundcloud_long_form():
+    url = "https://soundcloud.com/artist/track"
+    assert songlink_url(url) == f"https://song.link/{url}"
+
+
+def test_songlink_url_other_returns_none():
+    assert songlink_url("https://psv4.vkuseraudio.net/s/v1/ac/xxx") is None
+    assert songlink_url("") is None

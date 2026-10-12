@@ -19,6 +19,17 @@ _send_lock = asyncio.Lock()
 _last_send = 0.0
 _send_interval = 3.0
 _blocked_until = 0.0  # до какого времени все отправки ждут (после FloodWait)
+_bot_username = ""
+
+
+def set_bot_username(name: str) -> None:
+    """Username самого бота — для подписи «via @...»."""
+    global _bot_username
+    _bot_username = (name or "").lstrip("@")
+
+
+def bot_username() -> str:
+    return _bot_username
 
 
 def set_send_interval(seconds: float) -> None:
@@ -75,7 +86,7 @@ class TelegramSender:
             raise last_exc
         raise RuntimeError("send failed")
 
-    async def send_by_file_id(self, channel_id: int, file_id: str, track: Track, cover=None, reply_markup=None) -> dict:
+    async def send_by_file_id(self, channel_id: int, file_id: str, track: Track, cover=None, reply_markup=None, caption=None) -> dict:
         """Отправляет аудио по кэшированному file_id (без загрузки файла)."""
         result = await self._send_with_retry(lambda: self.bot.send_audio(
             chat_id=channel_id,
@@ -84,6 +95,7 @@ class TelegramSender:
             title=track.title or None,
             thumbnail=_cover_input(cover),
             reply_markup=reply_markup,
+            caption=caption,
         ))
         cover_file_id = ""
         if result.audio and result.audio.thumbnail:
@@ -91,7 +103,7 @@ class TelegramSender:
         log.info("sent_by_file_id", artist=track.artist, title=track.title, channel=channel_id)
         return {"file_id": file_id, "cover_file_id": cover_file_id}
 
-    async def send_file(self, channel_id: int, file_path: str, track: Track, cover=None, reply_markup=None) -> dict:
+    async def send_file(self, channel_id: int, file_path: str, track: Track, cover=None, reply_markup=None, caption=None) -> dict:
         """Загружает и отправляет mp3 с обложкой."""
         result = await self._send_with_retry(lambda: self.bot.send_audio(
             chat_id=channel_id,
@@ -101,6 +113,7 @@ class TelegramSender:
             duration=track.duration if track.duration > 0 else None,
             thumbnail=_cover_input(cover),
             reply_markup=reply_markup,
+            caption=caption,
         ))
         file_id = result.audio.file_id if result.audio else None
         cover_file_id = ""

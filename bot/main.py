@@ -86,7 +86,13 @@ async def main():
     link.set_storage(storage)
     processor.set_vk_token(config.vk_token)
     processor.set_stats_path(os.path.join(config.data_dir, "stats.json"))
+    processor.set_caption(config.audio_caption)
     tg_sender.set_send_interval(config.send_interval)
+    try:
+        me = await bot.me()
+        tg_sender.set_bot_username(config.via_username or (me.username or ""))
+    except Exception as e:
+        _log.warning("bot_me_failed", error=str(e))
     playlist.set_dependencies(
         cache_mgr=cache_mgr, storage=storage,
         max_playlist_size=config.max_playlist_size, rate_limit=config.rate_limit_search,
