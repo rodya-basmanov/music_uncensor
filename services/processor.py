@@ -10,7 +10,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,7 +22,7 @@ from core.scraper import soundcloud, youtube
 from core.scraper.common import (
     Candidate,
     DownloadResult,
-    download_audio,
+    download_audio_async,
     normalize,
     rank_candidates,
     score_candidate,
@@ -287,11 +287,18 @@ def set_vk_cover_min_score(score: float) -> None:
         _vk_cover_min_score = 90.0
 
 
+_vk_cover_cache: Dict[tuple, tuple] = {}
+
+
 def _fetch_vk_cover(artist: str, title: str) -> str:
     """Ищет обложку в VK; возвращает URL только при хорошем совпадении (иначе пусто)."""
     if not _vk_fetcher or not (artist or title):
         return ""
     query = f"{artist} {title}".strip()
+    ck = (query.lower(),)
+    hit = _vk_cover_cache.get(ck)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
     try:
         cands = _vk_fetcher.search(query, 3)
     except Exception:
@@ -306,10 +313,12 @@ def _fetch_vk_cover(artist: str, title: str) -> str:
         score = 0.6 * title_score + 0.4 * artist_score
         if score > best_score:
             best_score, best_url = score, c.cover_url
+    result = ""
     if best_url and best_score >= _vk_cover_min_score:
         log.info("vk_cover_found", score=round(best_score, 1))
-        return best_url
-    return ""
+        result = best_url
+    _vk_cover_cache[ck] = (time.time(), result)
+    return result
 
 
 def set_stats_path(path: str) -> None:
@@ -548,7 +557,7 @@ async def _edit_status(bot: Bot, status: TaskStatus, final: bool = False, force:
     if not status.status_message_id or not status.status_chat_id:
         return
     now = time.time()
-    if not force and now - status.last_edit < 2.0:
+    if not force and now - status.last_edit < 3.0:
         return
     status.last_edit = now
     if final:
@@ -709,13 +718,14 @@ async def _process_tracks(
                 await _edit_status(bot, status)
 
                 result = await _process_single_track(
-                    track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode, status.user_id,
+                    track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
+                    status.user_id, cancel=lambda: status.cancelled,
                 )
                 _apply_result(status, track, result)
                 await _edit_status(bot, status)
 
-                if i < len(tracks) - 1 and mode != "vk":
-                    await asyncio.sleep(random.uniform(rate_limit, rate_limit + 2))
+                if i < len(tracks) - 1 and mode != "vk" and not result.startswith("sent_cached"):
+                    await asyncio.sleep(random.uniform(rate_limit, rate_limit + 0.5))
         else:
             lock = asyncio.Lock()
             queue: asyncio.Queue = asyncio.Queue()
@@ -730,7 +740,8 @@ async def _process_tracks(
                         return
                     try:
                         result = await _process_single_track(
-                            track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode, status.user_id,
+                            track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
+                            status.user_id, cancel=lambda: status.cancelled,
                         )
                     except Exception as e:
                         log.error("track_worker_error", error=str(e), title=track.title)
@@ -742,8 +753,8 @@ async def _process_tracks(
                         _apply_result(status, track, result)
                         await _edit_status(bot, status)
 
-                    if mode != "vk":
-                        await asyncio.sleep(random.uniform(rate_limit, rate_limit + 2))
+                    if mode != "vk" and not result.startswith("sent_cached"):
+                        await asyncio.sleep(random.uniform(rate_limit, rate_limit + 0.5))
 
             n = max(1, min(concurrency, len(tracks)))
             workers = [asyncio.create_task(worker()) for _ in range(n)]
@@ -830,9 +841,10 @@ async def _download_vk_media(
     ytdlp_proxy: str,
     artist: str = "",
     title: str = "",
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> tuple[Optional[str], str]:
     """Скачивает аудио из VK (mp3/HLS) + обложку. Возвращает (mp3_path, cover_path)."""
-    dr = await asyncio.to_thread(download_audio, media_url, work_dir, "audio", "", "vk", False)
+    dr = await download_audio_async(media_url, work_dir, "audio", "", "vk", False, cancel=cancel)
     if not dr or not dr.file_path:
         return None, ""
 
@@ -869,6 +881,7 @@ async def _download_and_send(
     vk_cover_url: str = "",
     user_id: int = 0,
     display_override: Optional[tuple[str, str]] = None,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> Optional[dict]:
     """Скачивает конкретного кандидата и отправляет в канал.
 
@@ -883,7 +896,7 @@ async def _download_and_send(
         if cand.source == "vk":
             final_mp3, cover_path = await _download_vk_media(
                 cand.url, cand.cover_url, work_dir, cache_mgr, hash_key, ytdlp_proxy,
-                cand.artist, cand.title,
+                cand.artist, cand.title, cancel=cancel,
             )
             if not final_mp3:
                 return None
@@ -897,8 +910,8 @@ async def _download_and_send(
                 except OSError:
                     bitrate = 0
         else:
-            dr = await asyncio.to_thread(
-                download_audio, cand.url, work_dir, "audio", ytdlp_proxy, cand.source,
+            dr = await download_audio_async(
+                cand.url, work_dir, "audio", ytdlp_proxy, cand.source, cancel=cancel,
             )
             if not dr or not dr.file_path:
                 return None
@@ -1068,13 +1081,14 @@ async def _download_vk_and_send(
     ytdlp_proxy: str = "",
     user_id: int = 0,
     display_override: Optional[tuple[str, str]] = None,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> Optional[dict]:
     """Скачивает трек напрямую из VK (точная версия + обложка)."""
     work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
     try:
         final_mp3, cover_path = await _download_vk_media(
             track.url, track.cover_url, work_dir, cache_mgr, hash_key, ytdlp_proxy,
-            track.artist, track.title,
+            track.artist, track.title, cancel=cancel,
         )
         if not final_mp3:
             return None
@@ -1132,6 +1146,7 @@ async def _process_single_track(
     ytdlp_proxy: str = "",
     mode: str = "uncensored",
     user_id: int = 0,
+    cancel: Optional[Callable[[], bool]] = None,
 ) -> str:
     hash_key = generate_hash(track.artist or track.query or "", track.title)
     vk_available = track.source == "vk" and bool(track.url)
@@ -1187,7 +1202,7 @@ async def _process_single_track(
         if vk_track and vk_track.url:
             info = await _download_vk_and_send(
                 vk_track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
-                (track.artist, track.title) if track.force_meta else None,
+                (track.artist, track.title) if track.force_meta else None, cancel=cancel,
             )
             if info:
                 log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
@@ -1203,14 +1218,27 @@ async def _process_single_track(
         query = f"{artist_hint} {clean_title_for_search(track.title)}".strip()
 
     order = _effective_order(source_order, bool(track.query) or is_mashup(track.title) or is_mashup(track.artist))
+    sources = [s for s in order if _provider(s)]
+
+    async def _search_src(src: str) -> list:
+        cached = _cache_get(src, query)
+        if cached is not None:
+            return cached
+        try:
+            cands = await asyncio.to_thread(_provider(src), query, 5, ytdlp_proxy)
+        except Exception as e:
+            log.warning("search_error", source=src, query=query, error=str(e))
+            cands = []
+        _cache_put(src, query, cands)
+        return cands
 
     try:
-        for source_name in order:
-            searcher = _provider(source_name)
-            if not searcher:
-                continue
+        # ищем во всех источниках параллельно, а качаем по приоритету
+        found = await asyncio.gather(*(_search_src(s) for s in sources))
+        by_source = dict(zip(sources, found))
 
-            candidates = await asyncio.to_thread(searcher, query, 5, ytdlp_proxy)
+        for source_name in sources:
+            candidates = by_source.get(source_name) or []
             ranked = rank_candidates(candidates, query, track.duration, artist_hint, limit=3)
             if not ranked:
                 continue
@@ -1226,6 +1254,7 @@ async def _process_single_track(
                     artist_hint, track.duration, track.artist, track.title, query,
                     track.cover_url, user_id,
                     (track.artist, track.title) if track.force_meta else None,
+                    cancel=cancel,
                 )
                 if info:
                     log.info("track_sent", source=info["source"], display=f"{info['artist']} - {info['title']}")
@@ -1235,7 +1264,7 @@ async def _process_single_track(
         if mode != "vk" and vk_available:
             info = await _download_vk_and_send(
                 track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
-                (track.artist, track.title) if track.force_meta else None,
+                (track.artist, track.title) if track.force_meta else None, cancel=cancel,
             )
             if info:
                 log.info("track_sent_vk_fallback", display=f"{info['artist']} - {info['title']}")

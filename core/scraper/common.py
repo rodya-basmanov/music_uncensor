@@ -1,10 +1,11 @@
 """Общие утилиты источников: модель кандидата, ранжирование, запуск yt-dlp."""
 
+import asyncio
 import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from rapidfuzz import fuzz
 
@@ -155,9 +156,50 @@ def rank_candidates(
 
 
 def run_ytdlp(args: List[str], timeout: int = 120) -> subprocess.CompletedProcess:
-    """Запускает yt-dlp с базовыми флагами."""
+    """Запускает yt-dlp с базовыми флагами (синхронно)."""
     cmd = ["yt-dlp", "--no-warnings", "--no-update"] + _pot_args() + args
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="ignore")
+
+
+async def run_ytdlp_async(
+    args: List[str],
+    timeout: int = 120,
+    cancel: Optional[Callable[[], bool]] = None,
+) -> Optional[tuple[int, str, str]]:
+    """Запускает yt-dlp асинхронно. При cancel()==True убивает процесс.
+
+    Возвращает (returncode, stdout, stderr) или None (отмена/таймаут/ошибка).
+    """
+    cmd = ["yt-dlp", "--no-warnings", "--no-update"] + _pot_args() + args
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as e:
+        log.warning("ytdlp_spawn_error", error=str(e))
+        return None
+
+    comm = asyncio.ensure_future(proc.communicate())
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    try:
+        while True:
+            done, _ = await asyncio.wait({comm}, timeout=1.0)
+            if comm in done:
+                out, err = comm.result()
+                return int(proc.returncode or 0), out.decode("utf-8", "ignore"), err.decode("utf-8", "ignore")
+            if (cancel is not None and cancel()) or loop.time() > deadline:
+                proc.kill()
+                await asyncio.gather(comm, return_exceptions=True)
+                return None
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        await asyncio.gather(comm, return_exceptions=True)
+        log.warning("ytdlp_async_error", error=str(e))
+        return None
 
 
 def parse_search_output(stdout: str, source: str) -> List[Candidate]:
@@ -183,18 +225,10 @@ def parse_search_output(stdout: str, source: str) -> List[Candidate]:
     return results
 
 
-def download_audio(
-    url: str,
-    dest_dir: str,
-    out_stem: str,
-    proxy: str = "",
-    source: str = "",
-    embed_thumb: bool = True,
-) -> Optional[DownloadResult]:
-    """Скачивает аудио в mp3 (yt-dlp). Поддерживает mp3-ссылки и HLS (VK).
-
-    embed_thumb=False — не встраивать/не писать обложку (для VK, где своя обложка).
-    """
+def _download_args(
+    url: str, dest_dir: str, out_stem: str, proxy: str, embed_thumb: bool,
+) -> tuple[List[str], str, str]:
+    """Готовит аргументы yt-dlp для скачивания аудио в mp3."""
     os.makedirs(dest_dir, exist_ok=True)
     out_tmpl = os.path.join(dest_dir, f"{out_stem}.%(ext)s")
     final_mp3 = os.path.join(dest_dir, f"{out_stem}.mp3")
@@ -208,9 +242,9 @@ def download_audio(
                 pass
 
     args = [
-        "--no-warnings", "--no-update", "--force-overwrites",
+        "--force-overwrites",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--concurrent-fragments", "4",
+        "--concurrent-fragments", "8",
         "--paths", dest_dir,
         "--output", out_tmpl,
         "--no-simulate",
@@ -222,35 +256,33 @@ def download_audio(
     if proxy:
         args += ["--proxy", proxy]
     args.append(url)
+    return args, final_mp3, final_thumb
 
-    try:
-        result = run_ytdlp(args, timeout=180)
-    except subprocess.TimeoutExpired:
-        log.warning("download_timeout", url=url, source=source)
-        return None
-    except Exception as e:
-        log.warning("download_error", url=url, source=source, error=str(e))
-        return None
+
+def _collect_download(
+    dest_dir: str, out_stem: str, url: str, source: str, stdout: str, stderr: str,
+) -> Optional[DownloadResult]:
+    """Собирает DownloadResult из результатов yt-dlp (или None при неудаче)."""
+    final_mp3 = os.path.join(dest_dir, f"{out_stem}.mp3")
+    final_thumb = os.path.join(dest_dir, f"{out_stem}.jpg")
 
     if not os.path.exists(final_mp3) or os.path.getsize(final_mp3) < 1024:
-        # ищем mp3 по имени стема
         found = None
         for f in os.listdir(dest_dir):
             if f.startswith(out_stem) and f.endswith(".mp3"):
                 found = os.path.join(dest_dir, f)
                 break
         if not found:
-            log.warning("download_failed", url=url, source=source, stderr=(result.stderr or "")[:200])
+            log.warning("download_failed", url=url, source=source, stderr=(stderr or "")[:200])
             return None
         final_mp3 = found
 
-    # метаданные
     artist = title = ""
     duration = 0
     bitrate = 0
     thumb_url = ""
     source_url = url
-    for line in (result.stdout or "").splitlines():
+    for line in (stdout or "").splitlines():
         if line.startswith("META|||"):
             parts = line.split("|||")
             if len(parts) >= 6:
@@ -271,7 +303,6 @@ def download_audio(
                         bitrate = 0
             break
 
-    # обложка: ищем файл с нашим стемом (jpg/png/webp)
     cover_path = final_thumb if os.path.exists(final_thumb) else ""
     if not cover_path:
         for f in os.listdir(dest_dir):
@@ -292,3 +323,43 @@ def download_audio(
         thumbnail_url=thumb_url,
         bitrate=bitrate,
     )
+
+
+def download_audio(
+    url: str,
+    dest_dir: str,
+    out_stem: str,
+    proxy: str = "",
+    source: str = "",
+    embed_thumb: bool = True,
+) -> Optional[DownloadResult]:
+    """Скачивает аудио в mp3 (yt-dlp), синхронно. Поддерживает mp3-ссылки и HLS (VK)."""
+    args, _, _ = _download_args(url, dest_dir, out_stem, proxy, embed_thumb)
+    try:
+        result = run_ytdlp(args, timeout=180)
+    except subprocess.TimeoutExpired:
+        log.warning("download_timeout", url=url, source=source)
+        return None
+    except Exception as e:
+        log.warning("download_error", url=url, source=source, error=str(e))
+        return None
+    return _collect_download(dest_dir, out_stem, url, source, result.stdout, result.stderr)
+
+
+async def download_audio_async(
+    url: str,
+    dest_dir: str,
+    out_stem: str,
+    proxy: str = "",
+    source: str = "",
+    embed_thumb: bool = True,
+    cancel: Optional[Callable[[], bool]] = None,
+) -> Optional[DownloadResult]:
+    """Скачивает аудио в mp3 (yt-dlp) асинхронно; убивает процесс при cancel()."""
+    args, _, _ = _download_args(url, dest_dir, out_stem, proxy, embed_thumb)
+    res = await run_ytdlp_async(args, timeout=180, cancel=cancel)
+    if res is None:
+        log.warning("download_cancelled_or_timeout", url=url, source=source)
+        return None
+    _, out, err = res
+    return _collect_download(dest_dir, out_stem, url, source, out, err)

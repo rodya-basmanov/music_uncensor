@@ -60,17 +60,29 @@ class AlbumInfo:
         return " · ".join(parts)
 
 
+_sessions: dict[str, aiohttp.ClientSession] = {}
+
+
+def _session(proxy: str) -> aiohttp.ClientSession:
+    """Переиспользуемая aiohttp-сессия для прокси/без него."""
+    s = _sessions.get(proxy)
+    if s is None or s.closed:
+        connector = ProxyConnector.from_url(proxy) if proxy else None
+        s = aiohttp.ClientSession(connector=connector)
+        _sessions[proxy] = s
+    return s
+
+
 async def _get_json(url: str, proxy: str = "", timeout: int = 8) -> Optional[Any]:
-    connector = ProxyConnector.from_url(proxy) if proxy else None
+    session = _session(proxy)
     for attempt in range(2):
         try:
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
-                    url, headers={"User-Agent": _UA}, timeout=aiohttp.ClientTimeout(total=timeout),
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    return await resp.json(content_type=None)
+            async with session.get(
+                url, headers={"User-Agent": _UA}, timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.json(content_type=None)
         except Exception as e:
             if attempt == 1:
                 log.warning("album_http_error", url=url[:80], error=str(e))
@@ -161,6 +173,8 @@ async def pretty_artist(name: str, proxy: str = "", vk_fetcher=None) -> str:
     """
     if not name or vk_fetcher is None:
         return name
+    if any(ch.isupper() for ch in name):
+        return name  # регистр уже нормальный — не дёргаем VK
     candidates: list[str] = []
     try:
         res = await asyncio.wait_for(

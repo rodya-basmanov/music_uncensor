@@ -33,8 +33,8 @@ class Config:
 
     # Playlist processing
     max_playlist_size: int = 500
-    concurrency: int = 3
-    send_interval: float = 3.0
+    concurrency: int = 4
+    send_interval: float = 1.0
 
     # Audio caption (song.link + via @bot)
     audio_caption: bool = True
@@ -49,7 +49,7 @@ class Config:
     max_cache_size_gb: int = 20
 
     # Rate limit (seconds)
-    rate_limit_search: float = 2.0
+    rate_limit_search: float = 0.5
 
     # Logging
     log_level: str = "INFO"
@@ -88,15 +88,15 @@ def load_config() -> Config:
         source_order=source_order or ["youtube", "soundcloud"],
 
         max_playlist_size=int(os.getenv("MAX_PLAYLIST_SIZE", "500")),
-        concurrency=max(1, int(os.getenv("CONCURRENCY", "3"))),
-        send_interval=max(0.0, float(os.getenv("SEND_INTERVAL", "3"))),
+        concurrency=max(1, int(os.getenv("CONCURRENCY", "4"))),
+        send_interval=max(0.0, float(os.getenv("SEND_INTERVAL", "1"))),
         audio_caption=_env_bool("AUDIO_CAPTION", True),
         via_username=os.getenv("VIA_USERNAME", ""),
         vk_cover_min_score=int(os.getenv("VK_COVER_MIN_SCORE", "90")),
         cache_dir=os.getenv("CACHE_DIR", "./data/cache"),
         cache_ttl_days=int(os.getenv("CACHE_TTL_DAYS", "7")),
         max_cache_size_gb=int(os.getenv("MAX_CACHE_SIZE_GB", "20")),
-        rate_limit_search=float(os.getenv("RATE_LIMIT_SEARCH_SEC", "2")),
+        rate_limit_search=float(os.getenv("RATE_LIMIT_SEARCH_SEC", "0.5")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         sentry_dsn=os.getenv("SENTRY_DSN", ""),
         webhook_mode=_env_bool("WEBHOOK_MODE", False),

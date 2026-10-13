@@ -1,6 +1,7 @@
 """Точка входа бота — инициализация и запуск polling."""
 
 import asyncio
+import concurrent.futures
 import os
 import signal
 import sys
@@ -53,6 +54,11 @@ async def _shutdown(sig_name: str, cache_mgr: CacheManager, bot: Bot):
 
 async def main():
     global _shutdown_event, _log
+
+    # Больше потоков для параллельных yt-dlp процессов (поиск/скачивание)
+    asyncio.get_event_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="vk"),
+    )
 
     config = load_config()
     setup_logging(config.log_level)

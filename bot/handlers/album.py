@@ -267,15 +267,22 @@ async def _edit_card(message: Message, album: AlbumInfo, caption: str, kb: Inlin
         pass
 
 
-async def _enrich_rzt(bot, sent, token: str, album: AlbumInfo, user_id: int) -> None:
-    """Фоново подтягивает РЗТ и дорисовывает карточку (не тормозит показ)."""
-    rzt = await rzt_service.get_rating_for(album.artist, album.title)
-    if not rzt:
-        return
+async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -> None:
+    """Фоново: чинит регистр артиста и тянет РЗТ, затем дорисовывает карточку."""
+    casing, rzt = await asyncio.gather(
+        album_service.pretty_artist(album.artist, _ytdlp_proxy, _vk_fetcher),
+        rzt_service.get_rating_for(album.artist, album.title),
+    )
     data = _pending.get(token)
     if not data or data.get("user_id") != user_id:
         return
-    data["rzt"] = rzt
+    casing_changed = bool(casing) and casing != album.artist
+    if casing_changed:
+        album.artist = casing
+    if rzt:
+        data["rzt"] = rzt
+    if not casing_changed and not rzt:
+        return
     try:
         if data.get("view") == "select":
             await _edit_card(
@@ -291,7 +298,7 @@ async def _enrich_rzt(bot, sent, token: str, album: AlbumInfo, user_id: int) -> 
             )
     except Exception:
         pass
-    if rzt.get("nominations"):
+    if rzt and rzt.get("nominations"):
         nom_lines = "\n".join(f"• {esc_html(n)}" for n in rzt["nominations"])
         try:
             await bot.send_message(
@@ -307,7 +314,6 @@ async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user
     """Догружает альбом, чинит регистр артиста и сразу показывает карточку (РЗТ — фоном)."""
     _awaiting.pop(user_id, None)
     full = await album_service.get_album(alb.source, alb.id, _ytdlp_proxy) or alb
-    full.artist = await album_service.pretty_artist(full.artist, _ytdlp_proxy, _vk_fetcher)
 
     token = uuid.uuid4().hex[:8]
     _pending[token] = {
@@ -328,7 +334,7 @@ async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user
         pass
     sent = await _send_card(message.bot, message.chat.id, full, caption, kb)
     if sent is not None:
-        asyncio.create_task(_enrich_rzt(message.bot, sent, token, full, user_id))
+        asyncio.create_task(_enrich_album(message.bot, sent, token, full, user_id))
 
 
 # ----------------------------- команда ---------------------------------------
