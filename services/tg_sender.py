@@ -102,7 +102,7 @@ class TelegramSender:
         if result.audio and result.audio.thumbnail:
             cover_file_id = result.audio.thumbnail.file_id
         log.info("sent_by_file_id", artist=track.artist, title=track.title, channel=channel_id)
-        return {"file_id": file_id, "cover_file_id": cover_file_id}
+        return {"file_id": file_id, "cover_file_id": cover_file_id, "message_id": result.message_id}
 
     async def send_file(self, channel_id: int, file_path: str, track: Track, cover=None, reply_markup=None, caption=None) -> dict:
         """Загружает и отправляет mp3 с обложкой."""
@@ -122,4 +122,4 @@ class TelegramSender:
         if result.audio and result.audio.thumbnail:
             cover_file_id = result.audio.thumbnail.file_id
         log.info("sent_file", artist=track.artist, title=track.title, channel=channel_id)
-        return {"file_id": file_id, "cover_file_id": cover_file_id}
+        return {"file_id": file_id, "cover_file_id": cover_file_id, "message_id": result.message_id}

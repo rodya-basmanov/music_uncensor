@@ -943,6 +943,35 @@ def _effective_order(source_order: List[str], is_query: bool) -> List[str]:
     return ordered
 
 
+def _vk_find_track(track: Track) -> Optional[Track]:
+    """Ищет трек в VK и возвращает Track с прямой ссылкой (или None).
+
+    Используется в режиме «VK» для треков без готовой ссылки (напр. из альбома).
+    """
+    if not _vk_fetcher:
+        return None
+    artist_hint = clean_artist_for_search(track.artist)
+    query = f"{artist_hint} {clean_title_for_search(track.title)}".strip() or track.title
+    if not query:
+        return None
+    cands = _vk_search(query, 5)
+    if not cands:
+        return None
+    best = max(cands, key=lambda c: score_candidate(c, query, track.duration, artist_hint))
+    if artist_hint and score_candidate(best, query, track.duration, artist_hint) < MIN_MATCH_SCORE:
+        log.info("vk_weak_match", query=query)
+        return None
+    return Track(
+        artist=track.artist or best.artist,
+        title=track.title or best.title,
+        duration=track.duration or int(best.duration or 0),
+        url=best.url,
+        cover_url=track.cover_url or best.cover_url,
+        source="vk",
+        force_meta=track.force_meta,
+    )
+
+
 async def process_picked_candidate(
     user_id: int,
     channel_id: int,
@@ -1086,14 +1115,18 @@ async def _process_single_track(
             return "sent_cached_file"
 
     # --- VK: режим «Всё из VK» ---
-    if mode == "vk" and vk_available:
-        info = await _download_vk_and_send(
-            track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
-            (track.artist, track.title) if track.force_meta else None,
-        )
-        if info:
-            log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
-            return "sent_new"
+    if mode == "vk":
+        vk_track: Optional[Track] = track if vk_available else None
+        if vk_track is None:
+            vk_track = await asyncio.to_thread(_vk_find_track, track)
+        if vk_track and vk_track.url:
+            info = await _download_vk_and_send(
+                vk_track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
+                (track.artist, track.title) if track.force_meta else None,
+            )
+            if info:
+                log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
+                return "sent_new"
         log.warning("vk_direct_failed_fallback_search", artist=track.artist, title=track.title)
 
     # --- поиск по источникам ---

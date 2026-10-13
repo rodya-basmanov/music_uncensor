@@ -95,14 +95,32 @@ def _get(token: str, user_id: int) -> dict | None:
 
 # ----------------------------- отрисовка -------------------------------------
 
+_RU_MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def _fmt_release(date_str: str) -> str:
+    """ISO-дату ('2026-07-24' или с временем) → '24 июля 2026'."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_str or "")
+    if not m:
+        return (date_str or "")[:4]
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if 1 <= month <= 12:
+        return f"{day} {_RU_MONTHS[month - 1]} {year}"
+    return str(year)
+
+
 def _album_caption(album: AlbumInfo, show_selection: bool = False, selected: set | None = None) -> str:
     """Карточка альбома: заголовок + мета + таблица треков в <code>."""
     head = f"💿 <b>{esc_html(album.artist)} — {esc_html(album.title)}</b>"
     meta = []
     if album.artist:
         meta.append(f"🎤 {esc_html(album.artist)}")
-    if album.year:
-        meta.append(f"📅 {album.year}")
+    date_label = _fmt_release(album.release_date) if album.release_date else album.year
+    if date_label:
+        meta.append(f"📅 {date_label}")
     if album.genre:
         meta.append(f"🎧 {esc_html(album.genre)}")
     line2 = " · ".join(meta)
@@ -150,20 +168,25 @@ def _album_caption(album: AlbumInfo, show_selection: bool = False, selected: set
     return "\n".join(lines)
 
 
-def _card_keyboard(token: str, album: AlbumInfo) -> InlineKeyboardMarkup:
+def _mode_label(mode: str) -> str:
+    return "VK" if mode == "vk" else "🔀 Uncensored"
+
+
+def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored") -> InlineKeyboardMarkup:
     n = len(album.tracks)
     rows = [
         [InlineKeyboardButton(
             text=f"⬇️ Скачать весь альбом ({n})",
             callback_data=f"album_dl|{token}", style="primary",
         )],
+        [InlineKeyboardButton(text=f"🎚 Источник: {_mode_label(mode)}", callback_data=f"album_mode|{token}")],
         [InlineKeyboardButton(text="☑️ Выбрать треки", callback_data=f"album_sel|{token}")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"album_close|{token}", style="danger")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _select_keyboard(token: str, album: AlbumInfo, selected: set) -> InlineKeyboardMarkup:
+def _select_keyboard(token: str, album: AlbumInfo, selected: set, mode: str = "uncensored") -> InlineKeyboardMarkup:
     rows = []
     for i, t in enumerate(album.tracks):
         mark = "✅" if i in selected else "⬜"
@@ -171,6 +194,7 @@ def _select_keyboard(token: str, album: AlbumInfo, selected: set) -> InlineKeybo
         if len(label) > 60:
             label = label[:59] + "…"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"album_tg|{token}|{i}")])
+    rows.append([InlineKeyboardButton(text=f"🎚 Источник: {_mode_label(mode)}", callback_data=f"album_mode|{token}")])
     rows.append([InlineKeyboardButton(
         text=f"⬇️ Скачать выбранные ({len(selected)})",
         callback_data=f"album_dlsel|{token}", style="primary",
@@ -181,6 +205,20 @@ def _select_keyboard(token: str, album: AlbumInfo, selected: set) -> InlineKeybo
         InlineKeyboardButton(text="🔙 Назад", callback_data=f"album_back|{token}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_album_view(message: Message, token: str, data: dict) -> None:
+    """Перерисовывает карточку/выбор треков с учётом текущего источника."""
+    album = data["album"]
+    mode = data.get("mode", "uncensored")
+    if data.get("view") == "select":
+        await _edit_card(
+            message, album,
+            _album_caption(album, show_selection=True, selected=data["selected"]),
+            _select_keyboard(token, album, data["selected"], mode),
+        )
+    else:
+        await _edit_card(message, album, _album_caption(album), _card_keyboard(token, album, mode))
 
 
 async def _send_card(bot, chat_id: int, album: AlbumInfo, caption: str, kb: InlineKeyboardMarkup):
@@ -224,10 +262,12 @@ async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user
         "channel_id": channel_id,
         "album": full,
         "selected": set(range(len(full.tracks))),
+        "mode": "uncensored",
+        "view": "card",
         "created": time.time(),
     }
     caption = _album_caption(full)
-    kb = _card_keyboard(token, full)
+    kb = _card_keyboard(token, full, "uncensored")
     try:
         await message.delete()
     except Exception:
@@ -387,13 +427,9 @@ async def cb_album_sel(callback: CallbackQuery):
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    album, selected = data["album"], data["selected"]
+    data["view"] = "select"
     await callback.answer()
-    await _edit_card(
-        callback.message, album,
-        _album_caption(album, show_selection=True, selected=selected),
-        _select_keyboard(token, album, selected),
-    )
+    await _render_album_view(callback.message, token, data)
 
 
 @router.callback_query(F.data.startswith("album_tg|"))
@@ -413,13 +449,9 @@ async def cb_album_toggle(callback: CallbackQuery):
         selected.discard(i)
     else:
         selected.add(i)
-    album = data["album"]
+    data["view"] = "select"
     await callback.answer()
-    await _edit_card(
-        callback.message, album,
-        _album_caption(album, show_selection=True, selected=selected),
-        _select_keyboard(token, album, selected),
-    )
+    await _render_album_view(callback.message, token, data)
 
 
 @router.callback_query(F.data.startswith("album_all|"))
@@ -429,14 +461,10 @@ async def cb_album_all(callback: CallbackQuery):
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    album = data["album"]
-    data["selected"] = set(range(len(album.tracks)))
+    data["selected"] = set(range(len(data["album"].tracks)))
+    data["view"] = "select"
     await callback.answer()
-    await _edit_card(
-        callback.message, album,
-        _album_caption(album, show_selection=True, selected=data["selected"]),
-        _select_keyboard(token, album, data["selected"]),
-    )
+    await _render_album_view(callback.message, token, data)
 
 
 @router.callback_query(F.data.startswith("album_none|"))
@@ -446,14 +474,23 @@ async def cb_album_none(callback: CallbackQuery):
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    album = data["album"]
     data["selected"] = set()
+    data["view"] = "select"
     await callback.answer()
-    await _edit_card(
-        callback.message, album,
-        _album_caption(album, show_selection=True, selected=data["selected"]),
-        _select_keyboard(token, album, data["selected"]),
-    )
+    await _render_album_view(callback.message, token, data)
+
+
+@router.callback_query(F.data.startswith("album_mode|"))
+async def cb_album_mode(callback: CallbackQuery):
+    """Переключает источник скачивания: uncensored ⇄ VK."""
+    token = callback.data.split("|", 1)[1]
+    data = _get(token, callback.from_user.id)
+    if not data or "album" not in data:
+        await callback.answer("⌛ Устарело.", show_alert=True)
+        return
+    data["mode"] = "vk" if data.get("mode") != "vk" else "uncensored"
+    await callback.answer(f"Источник: {_mode_label(data['mode'])}")
+    await _render_album_view(callback.message, token, data)
 
 
 @router.callback_query(F.data.startswith("album_back|"))
@@ -463,9 +500,9 @@ async def cb_album_back(callback: CallbackQuery):
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    album = data["album"]
+    data["view"] = "card"
     await callback.answer()
-    await _edit_card(callback.message, album, _album_caption(album), _card_keyboard(token, album))
+    await _render_album_view(callback.message, token, data)
 
 
 @router.callback_query(F.data.startswith("album_close|"))
@@ -481,17 +518,15 @@ async def _launch(callback: CallbackQuery, data: dict, tracks: list[Track], name
     if not tracks:
         await callback.answer("Ничего не выбрано.", show_alert=True)
         return
+    mode = data.get("mode", "uncensored")
     await callback.answer("🚀 Запускаю…")
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
+    # Карточку альбома НЕ удаляем — прогресс пойдёт отдельным сообщением в ЛС.
     await playlist._start_processing(
         callback.message, "",
         channel_hint=str(data["channel_id"]),
         playlist_name_override=name,
         tracks_override=tracks,
-        mode="uncensored",
+        mode=mode,
         user_id=data["user_id"],
     )
 

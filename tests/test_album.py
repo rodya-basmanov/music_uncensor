@@ -1,6 +1,6 @@
 """Тесты парсинга альбомов (services/album.py) — без сети."""
 
-from bot.handlers.album import _album_tracks, _fallback_queries
+from bot.handlers.album import _album_tracks, _fallback_queries, _fmt_release
 from services.album import (
     AlbumInfo,
     _pick_casing,
@@ -131,6 +131,21 @@ def test_fallback_queries_drops_artist_word():
 
 def test_fallback_queries_empty_for_single_word():
     assert _fallback_queries("villian") == []
+
+
+def test_fmt_release_full_date():
+    assert _fmt_release("2026-07-24") == "24 июля 2026"
+    assert _fmt_release("2026-01-05T07:00:00Z") == "5 января 2026"
+
+
+def test_fmt_release_year_fallback():
+    assert _fmt_release("2026") == "2026"
+    assert _fmt_release("") == ""
+
+
+def test_parse_deezer_album_release_date():
+    a = parse_deezer_album(DEEZER_ALBUM)
+    assert a.release_date == "2026-07-24"
 
 
 def test_album_tracks_force_meta_and_cover():

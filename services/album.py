@@ -39,6 +39,7 @@ class AlbumInfo:
     artist: str
     title: str
     year: str = ""
+    release_date: str = ""
     genre: str = ""
     label: str = ""
     contributors: list[str] = field(default_factory=list)
@@ -124,6 +125,7 @@ def parse_deezer_album(data: Any) -> Optional[AlbumInfo]:
         artist=artist,
         title=data.get("title", ""),
         year=(data.get("release_date") or "")[:4],
+        release_date=data.get("release_date", "") or "",
         genre=", ".join(genres),
         label=data.get("label", ""),
         contributors=contributors,
@@ -180,6 +182,7 @@ def parse_itunes_album(data: Any) -> Optional[AlbumInfo]:
         artist=artist,
         title=collection.get("collectionName", ""),
         year=(collection.get("releaseDate") or "")[:4],
+        release_date=collection.get("releaseDate", "") or "",
         genre=collection.get("primaryGenreName", ""),
         cover_url=_itunes_cover(collection.get("artworkUrl100", "")),
         total_duration=sum(t.duration for t in tracks),

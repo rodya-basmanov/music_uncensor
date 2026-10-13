@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sentry_sdk
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import BotCommand
 from python_socks import ProxyError
 from sentry_sdk import capture_exception
@@ -110,14 +110,23 @@ async def main():
     @dp.error()
     async def sentry_error_handler(event):
         from aiogram.types import ErrorEvent
-        if isinstance(event, ErrorEvent):
-            capture_exception(event.exception)
-            if _log:
-                _log.error("unhandled_exception", error=str(event.exception))
-            asyncio.create_task(health_service.alert_owner(
-                f"Необработанное исключение:\n<code>{str(event.exception)[:300]}</code>",
-                key="unhandled",
-            ))
+        if not isinstance(event, ErrorEvent):
+            return
+        exc = event.exception
+        if isinstance(exc, TelegramBadRequest):
+            text = str(exc).lower()
+            if ("query is too old" in text or "query id is invalid" in text
+                    or "message is not modified" in text):
+                if _log:
+                    _log.debug("benign_bad_request", error=str(exc))
+                return
+        capture_exception(exc)
+        if _log:
+            _log.error("unhandled_exception", error=str(exc))
+        asyncio.create_task(health_service.alert_owner(
+            f"Необработанное исключение:\n<code>{str(exc)[:300]}</code>",
+            key="unhandled",
+        ))
 
     start.set_storage(storage)
     link.set_storage(storage)
