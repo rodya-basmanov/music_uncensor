@@ -94,3 +94,8 @@ def test_register_retry_roundtrip():
 
 def test_get_retry_unknown_token():
     assert get_retry("nope-not-a-token") is None
+
+
+def test_vk_token_status_missing():
+    processor.set_vk_token("")
+    assert processor.vk_token_status() == "missing"

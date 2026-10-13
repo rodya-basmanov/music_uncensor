@@ -72,7 +72,23 @@ async def cmd_health(message: Message):
         cs = _cache_mgr.get_cache_stats()
         cache_line = f"{cs['size_gb']:.2f} ГБ · {cs['files']} файлов"
 
-    vk_line = "✅ активна" if _vk_token else "❌ нет токена"
+    vk_map = {
+        "ok": "✅ активна",
+        "expired": "❌ токен истёк",
+        "error": "⚠️ ошибка сети",
+        "missing": "❌ не задан",
+        "unknown": "…",
+    }
+    vk_line = vk_map.get(processor.vk_token_status(), processor.vk_token_status())
+
+    tg = health.telegram_mode()
+    if tg == "proxy":
+        tg_line = f"через прокси (<code>{health.telegram_proxy()}</code>)"
+    elif tg == "direct":
+        tg_line = "прямое соединение"
+    else:
+        tg_line = "—"
+
     proxy_line = _ytdlp_proxy or "❌ нет"
     pot_line = "✅ настроен" if _pot_provider else "❌ нет"
 
@@ -84,8 +100,9 @@ async def cmd_health(message: Message):
         f"📊 Отправлено: <b>{stats.get('total_sent', 0)}</b> "
         f"(кеш: {stats.get('total_cached', 0)}, не найдено: {stats.get('total_not_found', 0)})\n"
         f"💾 Кэш: {cache_line}\n\n"
-        f"🎵 VK-сессия: {vk_line}\n"
-        f"🌐 Прокси: <code>{proxy_line}</code>\n"
+        f"📡 Telegram: {tg_line}\n"
+        f"🎵 VK-токен: {vk_line}\n"
+        f"🌐 Прокси (yt-dlp): <code>{proxy_line}</code>\n"
         f"🔑 PO-token: {pot_line}"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)

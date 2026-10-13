@@ -14,6 +14,24 @@ _send_dm: Optional[Callable[[int, str], Awaitable[bool]]] = None
 _last_alert: dict[str, float] = {}
 _ALERT_COOLDOWN = 300.0
 
+_telegram_mode: str = "unknown"
+_telegram_proxy: str = ""
+
+
+def set_telegram_mode(mode: str, proxy: str = "") -> None:
+    """Запоминает режим подключения к Telegram: 'proxy' | 'direct'."""
+    global _telegram_mode, _telegram_proxy
+    _telegram_mode = mode
+    _telegram_proxy = proxy
+
+
+def telegram_mode() -> str:
+    return _telegram_mode
+
+
+def telegram_proxy() -> str:
+    return _telegram_proxy
+
 
 def mark_start() -> None:
     """Фиксирует момент старта и сбрасывает heartbeat."""

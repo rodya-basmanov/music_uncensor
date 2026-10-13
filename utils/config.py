@@ -19,6 +19,7 @@ class Config:
     # Telegram
     bot_token: str = ""
     telegram_proxy_url: str = ""
+    telegram_proxy_required: bool = False
 
     # Sources
     vk_token: str = ""
@@ -78,6 +79,7 @@ def load_config() -> Config:
         bot_token=os.getenv("BOT_TOKEN", ""),
         data_dir=os.getenv("DATA_DIR", "./data"),
         telegram_proxy_url=telegram_proxy,
+        telegram_proxy_required=_env_bool("TELEGRAM_PROXY_REQUIRED", False),
 
         vk_token=os.getenv("VK_TOKEN", ""),
         vk_playlist_mode=os.getenv("VK_PLAYLIST_MODE", "ask").strip().lower() or "ask",

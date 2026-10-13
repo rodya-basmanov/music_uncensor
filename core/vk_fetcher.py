@@ -12,6 +12,17 @@ from utils.logger import get_logger
 log = get_logger("vk_fetcher")
 
 
+def _is_auth_error(err: object) -> bool:
+    """Похоже ли на истёкший/невалидный токен."""
+    text = str(err).lower()
+    return (
+        "access_token has expired" in text
+        or "authorization failed" in text
+        or "access_token is invalid" in text
+        or "[5]" in text
+    )
+
+
 def _cover_from_item(item: dict) -> str:
     """Достаёт URL обложки альбома из элемента audio.get."""
     album = item.get("album") or {}
@@ -29,6 +40,8 @@ class VKFetcher:
         self.token = token
         self._session: Any = None
         self._api: Any = None
+        self.auth_failed: bool = False
+        self.last_error: str = ""
 
     def _ensure_session(self) -> None:
         """Создаёт сессию VK API если ещё не создана."""
@@ -104,9 +117,14 @@ class VKFetcher:
                 playlist_id=playlist_id,
                 tracks_count=len(tracks),
             )
+            self.last_error = ""
         except vk_api.exceptions.ApiError as e:
+            self.last_error = str(e)
+            if _is_auth_error(e):
+                self.auth_failed = True
             log.error("vk_api_error", error=str(e), owner_id=owner_id, playlist_id=playlist_id)
         except Exception as e:
+            self.last_error = str(e)
             log.error("vk_fetch_error", error=str(e))
 
         return tracks
@@ -190,7 +208,15 @@ class VKFetcher:
         self._ensure_session()
         try:
             response = self._api.audio.search(q=query, count=count)
+            self.last_error = ""
+        except vk_api.exceptions.ApiError as e:
+            self.last_error = str(e)
+            if _is_auth_error(e):
+                self.auth_failed = True
+            log.warning("vk_search_error", query=query, error=str(e))
+            return []
         except Exception as e:
+            self.last_error = str(e)
             log.warning("vk_search_error", query=query, error=str(e))
             return []
 

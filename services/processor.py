@@ -56,39 +56,68 @@ MIN_MATCH_SCORE = 55
 
 # VK API клиент (регистрируется, если задан VK_TOKEN)
 _vk_fetcher = None
+# Статус VK-токена: ok / expired / error / missing / unknown
+_vk_status: str = "unknown"
 
 
 def set_vk_token(token: str) -> None:
     """Регистрирует VK-клиент для поиска/загрузки (вызывается при инициализации)."""
-    global _vk_fetcher
+    global _vk_fetcher, _vk_status
     if token:
         from core.vk_fetcher import VKFetcher
         _vk_fetcher = VKFetcher(token)
+        _vk_status = "unknown"
     else:
         _vk_fetcher = None
+        _vk_status = "missing"
+
+
+def vk_token_status() -> str:
+    """Статус VK-токена: ok / expired / error / missing / unknown."""
+    return _vk_status
 
 
 def _vk_search(query: str, count: int = 5, proxy: str = "") -> list:
+    global _vk_status
     if not _vk_fetcher:
         return []
-    return _vk_fetcher.search(query, count)
+    result = _vk_fetcher.search(query, count)
+    if _vk_fetcher.auth_failed:
+        _vk_status = "expired"
+    elif _vk_fetcher.last_error:
+        _vk_status = "error"
+    return result
 
 
 async def warm_vk() -> None:
-    """Прогрев VK-сессии на старте (чтобы первый поиск не ждал ~14с)."""
+    """Прогрев VK-сессии на старте + проверка токена."""
+    global _vk_status
     if not _vk_fetcher:
+        _vk_status = "missing"
         return
+    _vk_fetcher.auth_failed = False
+    _vk_fetcher.last_error = ""
     try:
         await asyncio.to_thread(_vk_fetcher.search, "music", 1)
-        log.info("vk_warmed_up")
     except Exception as e:
+        _vk_status = "error"
         log.warning("vk_warmup_failed", error=str(e))
+        return
+
+    if _vk_fetcher.auth_failed:
+        _vk_status = "expired"
+        log.warning("vk_token_expired")
         from services import health
         await health.alert_owner(
-            f"VK-сессия не прогрелась: <code>{str(e)[:200]}</code>\n"
-            "Проверьте <code>VK_TOKEN</code>.",
-            key="vk_warmup",
+            "VK_TOKEN истёк или недействителен — обновите токен в <code>.env</code>.",
+            key="vk_token",
         )
+    elif _vk_fetcher.last_error:
+        _vk_status = "error"
+        log.warning("vk_warmup_failed", error=_vk_fetcher.last_error)
+    else:
+        _vk_status = "ok"
+        log.info("vk_warmed_up")
 
 
 # Кэш результатов поиска: (source, query) -> (timestamp, [Candidate])

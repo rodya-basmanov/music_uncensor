@@ -23,6 +23,7 @@ from services import health as health_service
 from services import processor, tg_sender
 from utils.config import load_config
 from utils.logger import get_logger, setup_logging
+from utils.net import proxy_reachable
 from utils.storage import UserStorage
 
 _shutdown_event: asyncio.Event | None = None
@@ -71,9 +72,30 @@ async def main():
     cache_mgr = CacheManager(cache_dir=config.cache_dir, ttl_days=config.cache_ttl_days, max_size_gb=config.max_cache_size_gb)
 
     session = None
+    telegram_mode = "direct"
     if config.telegram_proxy_url:
-        session = AiohttpSession(proxy=config.telegram_proxy_url)
-        _log.info("telegram_proxy_enabled")
+        if proxy_reachable(config.telegram_proxy_url):
+            session = AiohttpSession(proxy=config.telegram_proxy_url)
+            telegram_mode = "proxy"
+            _log.info("telegram_proxy_enabled")
+        elif config.telegram_proxy_required:
+            _log.error("telegram_proxy_unreachable_required", proxy=config.telegram_proxy_url)
+            sys.exit(1)
+        else:
+            _log.warning(
+                "telegram_proxy_unreachable_fallback_direct", proxy=config.telegram_proxy_url,
+            )
+    else:
+        _log.info("telegram_direct")
+
+    if config.ytdlp_proxy:
+        if proxy_reachable(config.ytdlp_proxy):
+            _log.info("ytdlp_proxy_enabled", proxy=config.ytdlp_proxy)
+        else:
+            _log.warning("ytdlp_proxy_unreachable", proxy=config.ytdlp_proxy)
+
+    health_service.set_telegram_mode(telegram_mode, config.telegram_proxy_url)
+
     bot = Bot(token=config.bot_token, session=session)
     dp = Dispatcher()
 
@@ -223,9 +245,24 @@ async def main():
         retry_delay = 5
         max_retry_delay = 60
         polling_active = True
+        using_proxy = telegram_mode == "proxy"
         try:
             while polling_active:
                 try:
+                    if (
+                        not using_proxy
+                        and config.telegram_proxy_url
+                        and proxy_reachable(config.telegram_proxy_url)
+                    ):
+                        old_session = bot.session
+                        bot.session = AiohttpSession(proxy=config.telegram_proxy_url)
+                        using_proxy = True
+                        health_service.set_telegram_mode("proxy", config.telegram_proxy_url)
+                        try:
+                            await old_session.close()
+                        except Exception:
+                            pass
+                        _log.info("telegram_proxy_recovered", proxy=config.telegram_proxy_url)
                     me = await bot.me()
                     _log.info("bot_started", bot_id=me.id)
                     await dp.start_polling(bot)
