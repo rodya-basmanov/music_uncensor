@@ -210,6 +210,7 @@ def download_audio(
     args = [
         "--no-warnings", "--no-update", "--force-overwrites",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
+        "--concurrent-fragments", "4",
         "--paths", dest_dir,
         "--output", out_tmpl,
         "--no-simulate",

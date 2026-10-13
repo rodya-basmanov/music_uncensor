@@ -132,6 +132,7 @@ async def main():
     link.set_storage(storage)
     processor.set_vk_token(config.vk_token)
     processor.set_stats_path(os.path.join(config.data_dir, "stats.json"))
+    processor.set_exports_dir(os.path.join(config.data_dir, "exports"))
     processor.set_caption(config.audio_caption)
     processor.set_vk_cover_min_score(config.vk_cover_min_score)
     tg_sender.set_send_interval(config.send_interval)

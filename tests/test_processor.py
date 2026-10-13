@@ -1,5 +1,7 @@
 """Тесты логики процессора (services/processor.py) — чистые функции."""
 
+import os
+
 from core.scraper.common import Candidate, DownloadResult
 from services import processor, tg_sender
 from services.processor import (
@@ -99,3 +101,29 @@ def test_get_retry_unknown_token():
 def test_vk_token_status_missing():
     processor.set_vk_token("")
     assert processor.vk_token_status() == "missing"
+
+
+def test_export_task_writes_files(tmp_path):
+    processor.set_exports_dir(str(tmp_path))
+    tid = "exptask"
+    status = processor.TaskStatus(task_id=tid, user_id=1, channel_id=-100)
+    status.results = [
+        {"artist": "A", "title": "B", "status": "sent"},
+        {"artist": "C", "title": "D", "status": "not_found"},
+    ]
+    processor._tasks[tid] = status
+
+    data = processor.export_task(tid)
+    assert data is not None
+    assert data["count"] == 2
+    assert os.path.exists(data["txt"])
+    assert os.path.exists(data["json"])
+    with open(data["txt"], encoding="utf-8") as f:
+        txt = f.read()
+    assert "A - B" in txt
+    assert "C - D" in txt
+
+
+def test_export_task_empty_returns_none(tmp_path):
+    processor.set_exports_dir(str(tmp_path))
+    assert processor.export_task("missing-task") is None

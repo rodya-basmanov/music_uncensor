@@ -175,6 +175,7 @@ class TaskStatus:
     last_edit: float = 0.0
     playlist_name: str | None = None
     total_duration: int = 0
+    results: List[dict] = field(default_factory=list)
 
 
 # Глобальное хранилище задач (в MVP — в памяти)
@@ -326,6 +327,44 @@ def set_stats_path(path: str) -> None:
                 _stats[k] = data[k]
     except Exception as e:
         log.warning("stats_load_error", error=str(e))
+
+
+# Папка для экспорта списков треков
+_exports_dir: str = ""
+
+
+def set_exports_dir(path: str) -> None:
+    """Задаёт папку для .txt/.json экспорта списков."""
+    global _exports_dir
+    _exports_dir = path
+
+
+def export_task(task_id: str) -> Optional[dict]:
+    """Сохраняет список треков задачи в .txt и .json. Возвращает пути или None."""
+    status = _tasks.get(task_id)
+    if not status or not status.results or not _exports_dir:
+        return None
+    import json
+    try:
+        os.makedirs(_exports_dir, exist_ok=True)
+        name = status.playlist_name or f"task_{task_id}"
+        safe = re.sub(r"[^\w\-]+", "_", name, flags=re.UNICODE).strip("_")[:60] or f"task_{task_id}"
+        txt_path = os.path.join(_exports_dir, f"{safe}_{task_id}.txt")
+        json_path = os.path.join(_exports_dir, f"{safe}_{task_id}.json")
+
+        marks = {"sent": "✓", "not_found": "✗", "error": "!"}
+        lines = [
+            f"{marks.get(r.get('status', ''), '?')} {r.get('artist', '')} - {r.get('title', '')}".strip()
+            for r in status.results
+        ]
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(status.results, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("export_task_error", error=str(e))
+        return None
+    return {"txt": txt_path, "json": json_path, "count": len(status.results), "name": name}
 
 
 def _save_stats(force: bool = False) -> None:
@@ -511,16 +550,22 @@ async def _edit_status(bot: Bot, status: TaskStatus, final: bool = False, force:
     status.last_edit = now
     if final:
         markup = None
+        rows = []
         if status.failed_objects and not status.cancelled:
             token = register_retry(
                 status.failed_objects, status.channel_id, status.user_id, status.mode,
             )
-            markup = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text=f"🔁 Докачать не найденные ({len(status.failed_objects)})",
-                    callback_data=f"retry|{token}", style="primary",
-                ),
-            ]])
+            rows.append([InlineKeyboardButton(
+                text=f"🔁 Докачать не найденные ({len(status.failed_objects)})",
+                callback_data=f"retry|{token}", style="primary",
+            )])
+        if status.results:
+            rows.append([InlineKeyboardButton(
+                text="📄 Скачать список",
+                callback_data=f"export|{status.task_id}",
+            )])
+        if rows:
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
     else:
         markup = _status_keyboard(status.task_id)
     await edit_rich(
@@ -575,16 +620,25 @@ def _apply_result(status: TaskStatus, track: Track, result: str) -> None:
     if result in ("sent_cached_file_id", "sent_cached_file"):
         status.sent += 1
         status.cached += 1
+        entry_status = "sent"
     elif result == "sent_new":
         status.sent += 1
+        entry_status = "sent"
     elif result == "not_found":
         status.not_found += 1
         status.failed_tracks.append(_track_label(track))
         status.failed_objects.append(track)
+        entry_status = "not_found"
     else:
         status.errors += 1
         status.failed_tracks.append(f"{_track_label(track)} (ошибка)")
         status.failed_objects.append(track)
+        entry_status = "error"
+    status.results.append({
+        "artist": track.artist or "",
+        "title": track.title or "",
+        "status": entry_status,
+    })
 
 
 async def _process_tracks(

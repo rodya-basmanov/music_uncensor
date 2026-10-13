@@ -3,9 +3,15 @@
 from aiogram import F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
-from services.processor import get_task_status
+from services.processor import export_task, get_task_status
 
 router = Router()
 
@@ -132,3 +138,25 @@ async def refresh_status(callback: CallbackQuery):
         await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     except Exception:
         await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("export|"))
+async def cb_export(callback: CallbackQuery):
+    """Кнопка «📄 Скачать список» — отправляет .txt и .json в ЛС."""
+    task_id = callback.data.split("|", 1)[1]
+    status = get_task_status(task_id)
+    if not status or status.user_id != callback.from_user.id:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    data = export_task(task_id)
+    if not data:
+        await callback.answer("Нет данных для экспорта.", show_alert=True)
+        return
+    await callback.answer("Отправляю…")
+    try:
+        await callback.message.answer_document(
+            FSInputFile(data["txt"]), caption=f"📄 Список треков ({data['count']})",
+        )
+        await callback.message.answer_document(FSInputFile(data["json"]))
+    except Exception:
+        await callback.message.answer("❌ Не удалось отправить файл.")
