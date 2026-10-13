@@ -36,6 +36,7 @@ from utils.helpers import (
     Track,
     clean_artist_for_search,
     clean_title_for_search,
+    crop_text,
     parse_track_line,
 )
 from utils.links import find_youtube_link
@@ -359,12 +360,11 @@ def _picker_keyboard(token: str, data: dict, page: int) -> InlineKeyboardMarkup:
         tag = version_tag(c.title)
         artist = c.artist or c.uploader or ""
         prefix = " ".join(x for x in (icon, tag) if x)
-        label = f"{start + j + 1}. " + (f"{prefix} " if prefix else "") + c.title
+        suffix = f" · {fmt_duration_mmss(c.duration)}"
+        main = f"{start + j + 1}. " + (f"{prefix} " if prefix else "") + c.title
         if artist:
-            label += f" — {artist}"
-        label += f" · {fmt_duration_mmss(c.duration)}"
-        if len(label) > 60:
-            label = label[:59] + "…"
+            main += f" — {artist}"
+        label = crop_text(main, max(12, 60 - len(suffix))) + suffix
         rows.append([InlineKeyboardButton(text=label, callback_data=f"pick|{token}|{gi}")])
 
     # фильтр источников (активный — зелёный)
@@ -567,6 +567,7 @@ async def _start_processing(
     tracks_override: list[Track] | None = None,
     mode: str = "uncensored",
     user_id: int | None = None,
+    cover_url: str = "",
 ):
     """Парсинг треков, определение канала, запуск задачи."""
     user_id = user_id or message.from_user.id
@@ -629,6 +630,7 @@ async def _start_processing(
         ytdlp_proxy=_ytdlp_proxy,
         mode=mode,
         concurrency=_concurrency,
+        cover_url=cover_url,
     )
     log.info("playlist_task_created", task_id=task_id, user_id=user_id, channel_id=channel_id, tracks=len(tracks), mode=mode)
 

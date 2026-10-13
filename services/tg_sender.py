@@ -93,6 +93,7 @@ class TelegramSender:
             audio=file_id,
             performer=track.artist or None,
             title=track.title or None,
+            duration=track.duration if track.duration > 0 else None,
             thumbnail=_cover_input(cover),
             reply_markup=reply_markup,
             caption=caption,

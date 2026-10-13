@@ -205,7 +205,7 @@ YTDLP_POT_PROVIDER=http://127.0.0.1:4416
 | `/unlink -100XXX` | Отвязать канал |
 | `/status <id>` | Статус задачи |
 | `/stats` | Статистика |
-| `/album Артист Название` | Скачать целый альбом (Deezer/iTunes) |
+| `/album Артист Название` | Скачать целый альбом (Deezer) |
 | `/health` | Состояние бота (аптайм, heartbeat, задачи, кэш) — для владельца |
 | `/cancel` | Отменить текущую задачу |
 
@@ -263,7 +263,7 @@ vk_music/
 │       ├── status.py           # /status
 │       ├── cancel.py           # /cancel
 │       ├── health.py           # /health
-│       ├── album.py            # /album (Deezer/iTunes)
+│       ├── album.py            # /album (Deezer)
 │       └── stats.py            # /stats
 ├── core/
 │   ├── cover.py                # загрузка обложек (aiohttp/socks)
@@ -275,7 +275,7 @@ vk_music/
 │       └── soundcloud.py       # источник SoundCloud (scsearch)
 ├── services/
 │   ├── processor.py            # оркестрация: поиск → скачивание → отправка
-│   ├── album.py                # поиск/метаданные альбомов (Deezer → iTunes)
+│   ├── album.py                # поиск/метаданные альбомов (Deezer)
 │   ├── health.py               # heartbeat + алерты владельцу
 │   └── tg_sender.py            # отправка аудио + троттлинг/FloodWait
 ├── utils/

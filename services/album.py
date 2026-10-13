@@ -1,9 +1,9 @@
-"""Поиск и метаданные альбомов (Deezer → iTunes fallback).
+"""Поиск и метаданные альбомов (Deezer).
 
 Публичное:
     search_albums(query) -> list[AlbumInfo]
     get_album(source, id) -> AlbumInfo | None
-    pretty_artist(name) -> str   (best-effort регистр написания)
+    pretty_artist(name) -> str   (best-effort регистр написания, через VK)
 """
 
 import asyncio
@@ -14,8 +14,9 @@ from urllib.parse import quote_plus
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
+from rapidfuzz import fuzz
 
-from utils.helpers import Track
+from utils.helpers import Track, translit
 from utils.logger import get_logger
 
 log = get_logger("album")
@@ -59,19 +60,21 @@ class AlbumInfo:
         return " · ".join(parts)
 
 
-async def _get_json(url: str, proxy: str = "", timeout: int = 12) -> Optional[Any]:
+async def _get_json(url: str, proxy: str = "", timeout: int = 8) -> Optional[Any]:
     connector = ProxyConnector.from_url(proxy) if proxy else None
-    try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(
-                url, headers={"User-Agent": _UA}, timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.json(content_type=None)
-    except Exception as e:
-        log.warning("album_http_error", url=url[:80], error=str(e))
-        return None
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    url, headers={"User-Agent": _UA}, timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    return await resp.json(content_type=None)
+        except Exception as e:
+            if attempt == 1:
+                log.warning("album_http_error", url=url[:80], error=str(e))
+    return None
 
 
 async def _fetch(url: str, proxy: str = "") -> Optional[Any]:
@@ -135,61 +138,6 @@ def parse_deezer_album(data: Any) -> Optional[AlbumInfo]:
     )
 
 
-# ----------------------------- iTunes ----------------------------------------
-
-def _itunes_cover(url: str) -> str:
-    return (url or "").replace("100x100", "600x600").replace("60x60", "600x600")
-
-
-def parse_itunes_search(data: Any) -> list[AlbumInfo]:
-    out: list[AlbumInfo] = []
-    for r in (data or {}).get("results", []) or []:
-        if not r.get("collectionId"):
-            continue
-        out.append(AlbumInfo(
-            source="itunes",
-            id=str(r.get("collectionId")),
-            artist=r.get("artistName", ""),
-            title=r.get("collectionName", ""),
-            year=(r.get("releaseDate") or "")[:4],
-            genre=r.get("primaryGenreName", ""),
-            cover_url=_itunes_cover(r.get("artworkUrl100", "")),
-        ))
-    return out
-
-
-def parse_itunes_album(data: Any) -> Optional[AlbumInfo]:
-    results = (data or {}).get("results", []) or []
-    collection = next((r for r in results if r.get("wrapperType") == "collection"), None)
-    if not collection:
-        return None
-    artist = collection.get("artistName", "")
-    tracks: list[Track] = []
-    for r in results:
-        if r.get("wrapperType") != "track":
-            continue
-        title = (r.get("trackName") or "").strip()
-        if not title:
-            continue
-        tracks.append(Track(
-            artist=r.get("artistName", artist),
-            title=title,
-            duration=int((r.get("trackTimeMillis") or 0) // 1000),
-        ))
-    return AlbumInfo(
-        source="itunes",
-        id=str(collection.get("collectionId")),
-        artist=artist,
-        title=collection.get("collectionName", ""),
-        year=(collection.get("releaseDate") or "")[:4],
-        release_date=collection.get("releaseDate", "") or "",
-        genre=collection.get("primaryGenreName", ""),
-        cover_url=_itunes_cover(collection.get("artworkUrl100", "")),
-        total_duration=sum(t.duration for t in tracks),
-        tracks=tracks,
-    )
-
-
 # ----------------------------- регистр артиста --------------------------------
 
 def _pick_casing(name: str, candidates: list[str]) -> str:
@@ -207,22 +155,20 @@ def _pick_casing(name: str, candidates: list[str]) -> str:
 
 
 async def pretty_artist(name: str, proxy: str = "", vk_fetcher=None) -> str:
-    """Best-effort восстановление написания имени артиста (напр. villian → VILLIAN)."""
-    if not name:
+    """Best-effort восстановление написания имени артиста (напр. villian → VILLIAN).
+
+    Использует только VK (без iTunes), с таймаутом — Deezer отдаёт имя строчными.
+    """
+    if not name or vk_fetcher is None:
         return name
     candidates: list[str] = []
     try:
-        url = "https://itunes.apple.com/search?term=" + quote_plus(name) + "&entity=musicArtist&limit=8"
-        data = await _fetch(url, proxy)
-        candidates += [r.get("artistName", "") for r in (data or {}).get("results", []) or []]
+        res = await asyncio.wait_for(
+            asyncio.to_thread(vk_fetcher.search, name, 8), timeout=8,
+        )
+        candidates += [getattr(c, "artist", "") for c in res]
     except Exception:
         pass
-    if vk_fetcher is not None:
-        try:
-            res = await asyncio.to_thread(vk_fetcher.search, name, 8)
-            candidates += [getattr(c, "artist", "") for c in res]
-        except Exception:
-            pass
     picked = _pick_casing(name, candidates)
     if picked != name:
         log.info("artist_casing_fixed", original=name, picked=picked)
@@ -231,32 +177,75 @@ async def pretty_artist(name: str, proxy: str = "", vk_fetcher=None) -> str:
 
 # ----------------------------- публичное -------------------------------------
 
+def _query_variants(query: str) -> list[str]:
+    """Варианты для Deezer: как есть, транслит целиком, слово-артист, остаток.
+
+    Deezer по слову-артисту (`saluki`) отдаёт все его альбомы, тогда как по всей
+    фразе `салуки эйфория` может вернуть 0.
+    """
+    q = query.strip()
+    variants: list[str] = []
+
+    def add(s: str) -> None:
+        s = s.strip()
+        if s and s.lower() not in {v.lower() for v in variants}:
+            variants.append(s)
+
+    add(q)
+    add(translit(q))
+    words = [w for w in q.split() if w]
+    if len(words) > 1:
+        add(translit(words[0]))
+        add(translit(" ".join(words[1:])))
+    elif words:
+        add(translit(words[0]))
+    return variants[:4]
+
+
+def _rank_albums(query: str, albums: list[AlbumInfo]) -> list[AlbumInfo]:
+    """Сортирует альбомы по похожести на запрос (с учётом транслита)."""
+    q = translit(query).lower()
+    if not q:
+        return albums
+
+    def score(a: AlbumInfo) -> float:
+        hay = translit(f"{a.artist} {a.title}").lower()
+        return fuzz.token_set_ratio(q, hay)
+
+    return sorted(albums, key=score, reverse=True)
+
+
 async def search_albums(query: str, proxy: str = "", limit: int = 5) -> list[AlbumInfo]:
-    """Ищет альбомы: Deezer, при пустом результате — iTunes."""
+    """Ищет альбомы в Deezer по всем вариантам запроса (параллельно), ранжирует."""
     key = query.strip().lower()
     cached = _search_cache.get(key)
     if cached and time.time() - cached[0] < _CACHE_TTL:
         return cached[1]
 
-    url = (
-        "https://api.deezer.com/search/album?q="
-        + quote_plus(query) + f"&limit={limit}"
-    )
-    albums = parse_deezer_search(await _fetch(url, proxy))
-    if not albums:
-        url = (
-            "https://itunes.apple.com/search?term="
-            + quote_plus(query) + f"&media=music&entity=album&limit={limit}"
-        )
-        albums = parse_itunes_search(await _fetch(url, proxy))
+    per = max(limit, 10)
+    urls = [
+        "https://api.deezer.com/search/album?q=" + quote_plus(v) + f"&limit={per}"
+        for v in _query_variants(query)
+    ]
+    groups = await asyncio.gather(*(_fetch(u, proxy) for u in urls))
 
+    pool: list[AlbumInfo] = []
+    seen: set = set()
+    for data in groups:
+        for a in parse_deezer_search(data):
+            ck = (a.source, a.id)
+            if ck not in seen:
+                seen.add(ck)
+                pool.append(a)
+
+    albums = _rank_albums(query, pool)[:limit] if pool else []
     _search_cache[key] = (time.time(), albums)
     log.info("album_search_done", query=query[:40], count=len(albums))
     return albums
 
 
 async def get_album(source: str, album_id: str, proxy: str = "") -> Optional[AlbumInfo]:
-    """Загружает детали альбома (треки, год, жанр, лейбл, обложка)."""
+    """Загружает детали альбома Deezer (треки, год, жанр, лейбл, обложка)."""
     ck = (source, str(album_id))
     cached = _album_cache.get(ck)
     if cached and time.time() - cached[0] < _CACHE_TTL:
@@ -265,9 +254,6 @@ async def get_album(source: str, album_id: str, proxy: str = "") -> Optional[Alb
     album: Optional[AlbumInfo] = None
     if source == "deezer":
         album = parse_deezer_album(await _fetch(f"https://api.deezer.com/album/{album_id}", proxy))
-    elif source == "itunes":
-        url = f"https://itunes.apple.com/lookup?id={album_id}&entity=song"
-        album = parse_itunes_album(await _fetch(url, proxy))
 
     if album is not None:
         _album_cache[ck] = (time.time(), album)

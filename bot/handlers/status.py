@@ -140,23 +140,46 @@ async def refresh_status(callback: CallbackQuery):
         await callback.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
+@router.callback_query(F.data.startswith("export_menu|"))
+async def cb_export_menu(callback: CallbackQuery):
+    """Кнопка «📄 Скачать список» — выбор формата."""
+    task_id = callback.data.split("|", 1)[1]
+    status = get_task_status(task_id)
+    if not status or status.user_id != callback.from_user.id:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    await callback.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📄 TXT", callback_data=f"export|txt|{task_id}"),
+        InlineKeyboardButton(text="🗂 JSON", callback_data=f"export|json|{task_id}"),
+    ]])
+    await callback.message.answer(
+        "📄 <b>Скачать список</b>\nВыбери формат:", parse_mode=ParseMode.HTML, reply_markup=kb,
+    )
+
+
 @router.callback_query(F.data.startswith("export|"))
 async def cb_export(callback: CallbackQuery):
-    """Кнопка «📄 Скачать список» — отправляет .txt и .json в ЛС."""
-    task_id = callback.data.split("|", 1)[1]
+    """Отправляет выбранный формат списка (только успешно скачанные)."""
+    try:
+        _, fmt, task_id = callback.data.split("|")
+    except ValueError:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     status = get_task_status(task_id)
     if not status or status.user_id != callback.from_user.id:
         await callback.answer("Недоступно.", show_alert=True)
         return
     data = export_task(task_id)
     if not data:
-        await callback.answer("Нет данных для экспорта.", show_alert=True)
+        await callback.answer("Нет успешно скачанных треков.", show_alert=True)
         return
     await callback.answer("Отправляю…")
+    path = data["txt"] if fmt == "txt" else data["json"]
+    label = "TXT" if fmt == "txt" else "JSON"
     try:
         await callback.message.answer_document(
-            FSInputFile(data["txt"]), caption=f"📄 Список треков ({data['count']})",
+            FSInputFile(path), caption=f"📄 Список ({data['count']}) · {label}",
         )
-        await callback.message.answer_document(FSInputFile(data["json"]))
     except Exception:
         await callback.message.answer("❌ Не удалось отправить файл.")

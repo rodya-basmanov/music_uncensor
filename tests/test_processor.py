@@ -115,13 +115,14 @@ def test_export_task_writes_files(tmp_path):
 
     data = processor.export_task(tid)
     assert data is not None
-    assert data["count"] == 2
+    assert data["count"] == 1
     assert os.path.exists(data["txt"])
     assert os.path.exists(data["json"])
     with open(data["txt"], encoding="utf-8") as f:
         txt = f.read()
     assert "A - B" in txt
-    assert "C - D" in txt
+    assert "C - D" not in txt
+    assert "✓" not in txt
 
 
 def test_export_task_empty_returns_none(tmp_path):

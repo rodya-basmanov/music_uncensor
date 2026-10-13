@@ -5,9 +5,11 @@ from utils.helpers import (
     clean_artist_for_search,
     clean_title_for_display,
     clean_title_for_search,
+    crop_text,
     format_duration,
     generate_hash,
     parse_track_line,
+    translit,
 )
 
 
@@ -79,3 +81,18 @@ def test_format_duration():
     assert format_duration(30) == "30 сек"
     assert format_duration(90) == "1мин"
     assert format_duration(3900) == "1ч 5мин"
+
+
+def test_translit_cyrillic():
+    assert translit("салуки") == "saluki"
+    assert translit("Эйфория") == "Eyforiya"
+
+
+def test_translit_keeps_latin():
+    assert translit("SALUKI euphoria") == "SALUKI euphoria"
+
+
+def test_crop_text():
+    assert crop_text("abcdef", 10) == "abcdef"
+    assert crop_text("abcdefghij", 5) == "abcd…"
+    assert crop_text("abcdef", 1) == "…"

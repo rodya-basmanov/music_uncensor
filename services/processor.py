@@ -340,9 +340,12 @@ def set_exports_dir(path: str) -> None:
 
 
 def export_task(task_id: str) -> Optional[dict]:
-    """Сохраняет список треков задачи в .txt и .json. Возвращает пути или None."""
+    """Сохраняет успешно скачанные треки задачи в .txt/.json. Возвращает пути или None."""
     status = _tasks.get(task_id)
     if not status or not status.results or not _exports_dir:
+        return None
+    sent = [r for r in status.results if r.get("status") == "sent"]
+    if not sent:
         return None
     import json
     try:
@@ -352,19 +355,18 @@ def export_task(task_id: str) -> Optional[dict]:
         txt_path = os.path.join(_exports_dir, f"{safe}_{task_id}.txt")
         json_path = os.path.join(_exports_dir, f"{safe}_{task_id}.json")
 
-        marks = {"sent": "✓", "not_found": "✗", "error": "!"}
         lines = [
-            f"{marks.get(r.get('status', ''), '?')} {r.get('artist', '')} - {r.get('title', '')}".strip()
-            for r in status.results
+            f"{r.get('artist', '')} - {r.get('title', '')}".strip(" -")
+            for r in sent
         ]
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(status.results, f, ensure_ascii=False, indent=2)
+            json.dump(sent, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning("export_task_error", error=str(e))
         return None
-    return {"txt": txt_path, "json": json_path, "count": len(status.results), "name": name}
+    return {"txt": txt_path, "json": json_path, "count": len(sent), "name": name}
 
 
 def _save_stats(force: bool = False) -> None:
@@ -467,6 +469,7 @@ async def process_playlist(
     ytdlp_proxy: str = "",
     mode: str = "uncensored",
     concurrency: int = 3,
+    cover_url: str = "",
 ) -> str:
     task_id = str(uuid.uuid4())[:8]
     status = TaskStatus(
@@ -483,7 +486,7 @@ async def process_playlist(
         _process_tracks(
             status, tracks, bot, cache_mgr, rate_limit,
             playlist_name, total_duration, source_order or ["youtube", "soundcloud"], ytdlp_proxy, mode,
-            concurrency,
+            concurrency, cover_url,
         )
     )
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
@@ -562,7 +565,7 @@ async def _edit_status(bot: Bot, status: TaskStatus, final: bool = False, force:
         if status.results:
             rows.append([InlineKeyboardButton(
                 text="📄 Скачать список",
-                callback_data=f"export|{status.task_id}",
+                callback_data=f"export_menu|{status.task_id}",
             )])
         if rows:
             markup = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -653,6 +656,7 @@ async def _process_tracks(
     ytdlp_proxy: str = "",
     mode: str = "uncensored",
     concurrency: int = 1,
+    cover_url: str = "",
 ) -> None:
     """Внутренний цикл обработки треков (последовательно или пулом воркеров)."""
     sender = TelegramSender(bot)
@@ -678,6 +682,11 @@ async def _process_tracks(
 
         if playlist_name or total_duration:
             duration_str = format_duration(total_duration) if total_duration else "?"
+            if cover_url:
+                try:
+                    await bot.send_photo(status.channel_id, cover_url)
+                except Exception as e:
+                    log.warning("album_cover_send_error", error=str(e))
             try:
                 await send_rich(
                     bot, status.channel_id,
@@ -952,6 +961,7 @@ async def _download_and_send(
         "display_title": disp_title,
         "file_path": final_mp3,
         "cover_path": cover_path,
+        "duration": duration,
         "telegram_file_id": res.get("file_id") or "",
         "cover_file_id": res.get("cover_file_id") or "",
         "source": cand.source,
@@ -1101,6 +1111,7 @@ async def _download_vk_and_send(
         "display_title": disp_title,
         "file_path": final_mp3,
         "cover_path": cover_path,
+        "duration": track.duration or 0,
         "telegram_file_id": res.get("file_id") or "",
         "cover_file_id": res.get("cover_file_id") or "",
         "source": "vk",
@@ -1140,7 +1151,7 @@ async def _process_single_track(
         send_track = Track(
             artist=disp_artist,
             title=disp_title,
-            duration=track.duration,
+            duration=int(track.duration or cached.get("duration") or 0),
         )
         redo_query = (
             track.query

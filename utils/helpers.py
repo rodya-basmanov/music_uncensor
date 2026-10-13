@@ -111,3 +111,37 @@ def clean_title_for_display(title: str) -> str:
     cleaned = re.sub(r"\s+(?:prod\.?|produced by)\s+.+$", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
+
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit(text: str) -> str:
+    """Транслитерация кириллицы в латиницу (для поиска латинских названий)."""
+    out: list[str] = []
+    for ch in text or "":
+        low = ch.lower()
+        if low in _TRANSLIT:
+            t = _TRANSLIT[low]
+            out.append(t.upper() if ch.isupper() and t else t)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def crop_text(text: str, width: int) -> str:
+    """Обрезает строку до width символов, добавляя «…» при усечении."""
+    text = text or ""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[:width - 1].rstrip() + "…"
+

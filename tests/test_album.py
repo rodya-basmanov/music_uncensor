@@ -1,14 +1,15 @@
 """Тесты парсинга альбомов (services/album.py) — без сети."""
 
-from bot.handlers.album import _album_tracks, _fallback_queries, _fmt_release
+from bot.handlers.album import _album_caption, _album_tracks, _fallback_queries, _fmt_release
 from services.album import (
     AlbumInfo,
     _pick_casing,
+    _query_variants,
+    _rank_albums,
     parse_deezer_album,
     parse_deezer_search,
-    parse_itunes_album,
-    parse_itunes_search,
 )
+from utils.helpers import Track
 
 DEEZER_SEARCH = {
     "data": [
@@ -35,30 +36,6 @@ DEEZER_ALBUM = {
         {"title": "", "duration": 10},
     ]},
 }
-
-ITUNES_SEARCH = {
-    "results": [
-        {
-            "collectionId": 555, "artistName": "VILLIAN", "collectionName": "Красивое Зло",
-            "releaseDate": "2026-07-24T07:00:00Z", "primaryGenreName": "Hip-Hop/Rap",
-            "artworkUrl100": "https://art/100x100bb.jpg",
-        },
-        {"artistName": "no id"},
-    ]
-}
-
-ITUNES_ALBUM = {
-    "results": [
-        {
-            "wrapperType": "collection", "collectionId": 555, "artistName": "VILLIAN",
-            "collectionName": "Красивое Зло", "releaseDate": "2026-07-24T07:00:00Z",
-            "primaryGenreName": "Hip-Hop/Rap", "artworkUrl100": "https://art/100x100bb.jpg",
-        },
-        {"wrapperType": "track", "trackName": "Лицо Затоптали", "artistName": "VILLIAN", "trackTimeMillis": 104000},
-        {"wrapperType": "track", "trackName": "Оторву Руки", "artistName": "VILLIAN", "trackTimeMillis": 110000},
-    ]
-}
-
 
 def test_parse_deezer_search_skips_invalid():
     albums = parse_deezer_search(DEEZER_SEARCH)
@@ -90,24 +67,10 @@ def test_parse_deezer_album_error():
     assert parse_deezer_album(None) is None
 
 
-def test_parse_itunes_search():
-    albums = parse_itunes_search(ITUNES_SEARCH)
-    assert len(albums) == 1
-    a = albums[0]
-    assert a.source == "itunes"
-    assert a.id == "555"
-    assert a.artist == "VILLIAN"
-    assert a.year == "2026"
-    assert a.cover_url == "https://art/600x600bb.jpg"
+def test_parse_itunes_search_removed():
+    import services.album as album
 
-
-def test_parse_itunes_album():
-    a = parse_itunes_album(ITUNES_ALBUM)
-    assert a is not None
-    assert a.title == "Красивое Зло"
-    assert [t.title for t in a.tracks] == ["Лицо Затоптали", "Оторву Руки"]
-    assert a.tracks[0].duration == 104
-    assert a.total_duration == 214
+    assert not hasattr(album, "parse_itunes_search")
 
 
 def test_pick_casing_prefers_uppercase():
@@ -165,3 +128,37 @@ def test_album_tracks_force_meta_and_cover():
 
     only_b = _album_tracks(album, {1})
     assert [t.title for t in only_b] == ["B"]
+
+
+def test_query_variants_with_translit():
+    variants = _query_variants("салуки эйфория")
+    assert variants[0] == "салуки эйфория"
+    assert "saluki" in variants          # слово-артист (Deezer по нему находит альбом)
+    assert "eyforiya" in variants
+    assert len(variants) <= 4
+
+
+def test_rank_albums_prefers_match():
+    good = AlbumInfo(source="deezer", id="1", artist="SALUKI", title="EUPHORIA")
+    bad = AlbumInfo(source="deezer", id="2", artist="Random", title="Something Else")
+    ranked = _rank_albums("салуки эйфория", [bad, good])
+    assert ranked[0] is good
+
+
+def test_album_caption_keeps_duration_visible():
+    album = AlbumInfo(
+        source="deezer", id="1", artist="VILLIAN", title="Красивое Зло",
+        tracks=[
+            Track(artist="VILLIAN", title="Очень Длинное Название Трека Которое Надо Обрезать", duration=104),
+            Track(artist="VILLIAN", title="Короткий", duration=127),
+        ],
+    )
+    cap = _album_caption(album)
+    assert "<blockquote>" in cap and "</blockquote>" in cap
+    lines = [
+        ln.replace("<blockquote>", "").replace("</blockquote>", "")
+        for ln in cap.splitlines() if " · " in ln
+    ]
+    assert len(lines) == 2
+    assert "1:44" in lines[0] and "2:07" in lines[1]
+    assert all(len(ln) <= 32 for ln in lines)
