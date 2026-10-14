@@ -22,6 +22,7 @@ from core.cache_manager import CacheManager
 from core.scraper.common import set_pot_provider
 from services import health as health_service
 from services import processor, tg_sender
+from services import rzt as rzt_service
 from utils.config import load_config
 from utils.logger import get_logger, setup_logging
 from utils.net import proxy_reachable
@@ -46,6 +47,10 @@ async def _shutdown(sig_name: str, cache_mgr: CacheManager, bot: Bot):
             _log.error("cache_cleanup_error", error=str(e))
     try:
         await bot.session.close()
+    except Exception:
+        pass
+    try:
+        await rzt_service.close()
     except Exception:
         pass
     if _log:
