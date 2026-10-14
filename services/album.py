@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -73,7 +74,7 @@ def _session(proxy: str) -> aiohttp.ClientSession:
     return s
 
 
-async def _get_json(url: str, proxy: str = "", timeout: int = 8) -> Optional[Any]:
+async def _get_json(url: str, proxy: str = "", timeout: int = 4) -> Optional[Any]:
     session = _session(proxy)
     for attempt in range(2):
         try:
@@ -82,7 +83,14 @@ async def _get_json(url: str, proxy: str = "", timeout: int = 8) -> Optional[Any
             ) as resp:
                 if resp.status != 200:
                     return None
-                return await resp.json(content_type=None)
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and data.get("error"):
+                    err = data["error"]
+                    code = err.get("code") if isinstance(err, dict) else ""
+                    log.warning("deezer_error", url=url[:60], code=code)
+                    await asyncio.sleep(0.3)
+                    continue
+                return data
         except Exception as e:
             if attempt == 1:
                 log.warning("album_http_error", url=url[:80], error=str(e))
@@ -95,6 +103,148 @@ async def _fetch(url: str, proxy: str = "") -> Optional[Any]:
     if data is None and proxy:
         data = await _get_json(url, proxy)
     return data
+
+
+def _norm_title(s: str) -> str:
+    """Нормализация названия трека для сопоставления Deezer↔VK."""
+    s = translit(s or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _split_artists(artist_str: str) -> tuple[str, list[str]]:
+    """'SALUKI, Sabu' -> ('SALUKI', ['Sabu'])."""
+    parts = [p.strip() for p in re.split(r"\s*[,&/]\s*|\s+(?:feat|ft)\.?\s+", artist_str or "") if p.strip()]
+    if not parts:
+        return "", []
+    return parts[0], parts[1:]
+
+
+async def enrich_with_vk(album: AlbumInfo, vk_fetcher) -> int:
+    """Находит VK-альбом по пересечению треков и пришивает url/feat к трекам Deezer.
+
+    Возвращает число совпавших треков. Best-effort.
+    """
+    if vk_fetcher is None or not album.tracks:
+        return 0
+    query = f"{album.artist} {album.title}".strip()
+    try:
+        groups = await asyncio.to_thread(vk_fetcher.search_albums, query, 100)
+    except Exception as e:
+        log.warning("vk_album_search_error", error=str(e))
+        return 0
+    if not groups:
+        return 0
+
+    deezer_norms = {_norm_title(t.title) for t in album.tracks if t.title}
+    threshold = max(3, len(album.tracks) // 3)
+
+    def window_overlap(g: dict) -> int:
+        return len({_norm_title(t["title"]) for t in g["tracks"]} & deezer_norms)
+
+    ordered = sorted(groups, key=lambda g: (window_overlap(g), len(g["tracks"])), reverse=True)
+
+    vk_tracks: list[Track] = []
+    for g in ordered[:3]:
+        try:
+            cand = await asyncio.to_thread(
+                vk_fetcher.get_playlist_tracks, g["owner_id"], g["album_id"], g["access_key"], 200,
+            )
+        except Exception as e:
+            log.warning("vk_album_load_error", error=str(e))
+            continue
+        if not cand:
+            continue
+        # подтверждаем совпадение по полному треклисту
+        if len({_norm_title(v.title) for v in cand} & deezer_norms) >= threshold:
+            vk_tracks = cand
+            break
+    if not vk_tracks:
+        return 0
+
+    by_title: dict[str, Track] = {}
+    for v in vk_tracks:
+        by_title.setdefault(_norm_title(v.title), v)
+
+    main_artist = (album.artist or "").strip().lower()
+    matched = 0
+    for t in album.tracks:
+        vk_track = by_title.get(_norm_title(t.title))
+        if not vk_track:
+            continue
+        _, feats = _split_artists(vk_track.artist)
+        feats = [f for f in feats if f.lower() != main_artist]
+        if feats:
+            t.feat = feats
+        if vk_track.url:
+            t.url = vk_track.url
+            t.source = "vk"
+        if not t.cover_url and vk_track.cover_url:
+            t.cover_url = vk_track.cover_url
+        matched += 1
+    if matched:
+        log.info("vk_album_enriched", album=album.title[:40], matched=matched, total=len(album.tracks))
+    return matched
+
+
+async def search_albums_vk(query: str, vk_fetcher) -> list[AlbumInfo]:
+    """Ищет альбомы в VK (группировка по album.id). Best-effort."""
+    if vk_fetcher is None:
+        return []
+    try:
+        groups = await asyncio.to_thread(vk_fetcher.search_albums, query, 100)
+    except Exception as e:
+        log.warning("vk_album_search_error", error=str(e))
+        return []
+    out: list[AlbumInfo] = []
+    for g in groups[:5]:
+        if not g.get("tracks"):
+            continue
+        artist = (g.get("artists") or [query])[0]
+        title = g.get("title") or ""
+        if not title or title.lower() == "unnamed":
+            rem = re.sub(re.escape(artist), "", query, flags=re.IGNORECASE).strip(" -—")
+            title = rem or query
+        out.append(AlbumInfo(
+            source="vk",
+            id=f"{g['owner_id']}_{g['album_id']}_{g['access_key']}",
+            artist=artist,
+            title=title,
+            cover_url=g.get("cover_url") or "",
+        ))
+    return out
+
+
+async def get_album_vk(alb: AlbumInfo, vk_fetcher) -> Optional[AlbumInfo]:
+    """Загружает VK-альбом целиком (audio.get) по id 'owner_album_access'."""
+    if vk_fetcher is None:
+        return None
+    try:
+        owner, aid, key = str(alb.id).split("_", 2)
+    except ValueError:
+        return None
+    try:
+        raw = await asyncio.to_thread(vk_fetcher.get_playlist_tracks, int(owner), int(aid), key, 200)
+    except Exception as e:
+        log.warning("vk_album_load_error", error=str(e))
+        return None
+    if not raw:
+        return None
+    main_artist = (alb.artist or "").strip().lower()
+    tracks: list[Track] = []
+    for v in raw:
+        _, feats = _split_artists(v.artist)
+        feats = [f for f in feats if f.lower() != main_artist]
+        tracks.append(Track(
+            artist=alb.artist or v.artist, title=v.title, duration=v.duration,
+            url=v.url, cover_url=v.cover_url or alb.cover_url, source="vk", feat=feats,
+        ))
+    return AlbumInfo(
+        source="vk", id=alb.id, artist=alb.artist, title=alb.title,
+        cover_url=alb.cover_url or (tracks[0].cover_url if tracks else ""),
+        tracks=tracks,
+        total_duration=sum(t.duration for t in tracks if t.duration > 0),
+    )
 
 
 # ----------------------------- Deezer ----------------------------------------
@@ -125,6 +275,7 @@ def parse_deezer_album(data: Any) -> Optional[AlbumInfo]:
             continue
         tracks.append(Track(
             artist=artist, title=title, duration=int(t.get("duration") or 0),
+            source_id=str(t.get("id") or ""),
         ))
     genres = [g.get("name", "") for g in (data.get("genres") or {}).get("data", []) or []]
     contributors: list[str] = []
@@ -192,11 +343,7 @@ async def pretty_artist(name: str, proxy: str = "", vk_fetcher=None) -> str:
 # ----------------------------- публичное -------------------------------------
 
 def _query_variants(query: str) -> list[str]:
-    """Варианты для Deezer: как есть, транслит целиком, слово-артист, остаток.
-
-    Deezer по слову-артисту (`saluki`) отдаёт все его альбомы, тогда как по всей
-    фразе `салуки эйфория` может вернуть 0.
-    """
+    """Варианты для Deezer: как есть, транслит целиком, слово-артист, остаток."""
     q = query.strip()
     variants: list[str] = []
 
@@ -216,21 +363,22 @@ def _query_variants(query: str) -> list[str]:
     return variants[:4]
 
 
-def _rank_albums(query: str, albums: list[AlbumInfo]) -> list[AlbumInfo]:
-    """Сортирует альбомы по похожести на запрос (с учётом транслита)."""
+def _album_score(query: str, album: AlbumInfo) -> float:
+    """Похожесть альбома на запрос (с учётом транслита), 0-100."""
     q = translit(query).lower()
     if not q:
-        return albums
+        return 0.0
+    hay = translit(f"{album.artist} {album.title}").lower()
+    return fuzz.token_set_ratio(q, hay)
 
-    def score(a: AlbumInfo) -> float:
-        hay = translit(f"{a.artist} {a.title}").lower()
-        return fuzz.token_set_ratio(q, hay)
 
-    return sorted(albums, key=score, reverse=True)
+def _rank_albums(query: str, albums: list[AlbumInfo]) -> list[AlbumInfo]:
+    """Сортирует альбомы по похожести на запрос (с учётом транслита)."""
+    return sorted(albums, key=lambda a: _album_score(query, a), reverse=True)
 
 
 async def search_albums(query: str, proxy: str = "", limit: int = 5) -> list[AlbumInfo]:
-    """Ищет альбомы в Deezer по всем вариантам запроса (параллельно), ранжирует."""
+    """Ищет альбомы в Deezer по вариантам запроса (параллельно, с ранним выходом)."""
     key = query.strip().lower()
     cached = _search_cache.get(key)
     if cached and time.time() - cached[0] < _CACHE_TTL:
@@ -241,16 +389,32 @@ async def search_albums(query: str, proxy: str = "", limit: int = 5) -> list[Alb
         "https://api.deezer.com/search/album?q=" + quote_plus(v) + f"&limit={per}"
         for v in _query_variants(query)
     ]
-    groups = await asyncio.gather(*(_fetch(u, proxy) for u in urls))
-
+    tasks = [
+        asyncio.ensure_future(asyncio.wait_for(_fetch(u, proxy), timeout=8))
+        for u in urls
+    ]
     pool: list[AlbumInfo] = []
     seen: set = set()
-    for data in groups:
-        for a in parse_deezer_search(data):
-            ck = (a.source, a.id)
-            if ck not in seen:
-                seen.add(ck)
-                pool.append(a)
+    try:
+        for fut in asyncio.as_completed(tasks):
+            try:
+                data = await fut
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                for a in parse_deezer_search(data):
+                    ck = (a.source, a.id)
+                    if ck not in seen:
+                        seen.add(ck)
+                        pool.append(a)
+            # уверенное совпадение — не ждём медленные варианты
+            if pool and _album_score(query, _rank_albums(query, pool)[0]) >= 90:
+                break
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     albums = _rank_albums(query, pool)[:limit] if pool else []
     _search_cache[key] = (time.time(), albums)

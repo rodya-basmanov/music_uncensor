@@ -568,6 +568,7 @@ async def _start_processing(
     mode: str = "uncensored",
     user_id: int | None = None,
     cover_url: str = "",
+    channel_header: bool = True,
 ):
     """Парсинг треков, определение канала, запуск задачи."""
     user_id = user_id or message.from_user.id
@@ -631,6 +632,7 @@ async def _start_processing(
         mode=mode,
         concurrency=_concurrency,
         cover_url=cover_url,
+        channel_header=channel_header,
     )
     log.info("playlist_task_created", task_id=task_id, user_id=user_id, channel_id=channel_id, tracks=len(tracks), mode=mode)
 
@@ -899,9 +901,11 @@ async def _vk_choose_send(base_message: Message, user_id: int) -> None:
         parse_mode=ParseMode.HTML,
     )
     try:
-        # VK-вкладка = точный трек из плейлиста (без поиска по VK)
+        # если трек уже есть в VK — VK-вкладка = точный трек (1:1), без поиска по VK;
+        # иначе (напр. из альбома) ищем и в VK
+        sources = ["soundcloud", "youtube"] if extra_exact else ["soundcloud", "youtube", "vk"]
         all_c, filters = await _search_candidates(
-            query, extra_exact=extra_exact, sources=["soundcloud", "youtube"],
+            query, extra_exact=extra_exact, sources=sources,
         )
     except Exception as e:
         log.error("vk_choose_search_error", error=str(e))
@@ -940,6 +944,24 @@ async def _advance_choose(user_id: int, new_index: int) -> None:
     session = _pick_sessions.get(user_id)
     if session:
         session["index"] = new_index
+
+
+async def start_choose_session(
+    base_message: Message,
+    user_id: int,
+    channel_id: int,
+    name: str,
+    tracks: list[Track],
+) -> None:
+    """Запускает пер-трек выбор источника для произвольного списка треков."""
+    _pick_sessions[user_id] = {
+        "tracks": tracks,
+        "index": 0,
+        "channel_id": channel_id,
+        "name": name,
+        "created": time.time(),
+    }
+    await _vk_choose_send(base_message, user_id)
 
 
 async def _continue_choose(base_message: Message, user_id: int, next_index: int) -> None:
@@ -1102,6 +1124,7 @@ async def cb_retry(callback: CallbackQuery):
         tracks_override=data["tracks"],
         mode=data["mode"],
         user_id=data["user_id"],
+        channel_header=False,
     )
 
 
@@ -1231,7 +1254,7 @@ async def cb_pk_auto(callback: CallbackQuery):
     await _start_processing(
         callback.message, raw_text="", playlist_name_override=session["name"],
         tracks_override=remaining, channel_hint=str(session["channel_id"]), mode="vk",
-        user_id=callback.from_user.id,
+        user_id=callback.from_user.id, channel_header=False,
     )
 
 

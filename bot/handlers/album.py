@@ -14,6 +14,7 @@ from bot.handlers import playlist
 from services import album as album_service
 from services import rzt as rzt_service
 from services.album import AlbumInfo
+from utils.emoji import TextBuilder, ensure_detected, result_key, tier_key
 from utils.escape import esc_html
 from utils.helpers import Track, crop_text
 from utils.logger import get_logger
@@ -34,6 +35,9 @@ _pending: dict[str, dict] = {}
 # Пользователи, ожидающие ввод названия альбома: user_id -> expiry
 _awaiting: dict[int, float] = {}
 _AWAIT_TTL = 300
+
+# при таком совпадении показываем альбом сразу, без пикера
+_AUTO_PICK_SCORE = 90
 
 
 def _is_awaiting(message: Message) -> bool:
@@ -115,49 +119,71 @@ def _fmt_release(date_str: str) -> str:
 
 
 def _album_caption(album: AlbumInfo, show_selection: bool = False, selected: set | None = None,
-                   rzt: dict | None = None) -> str:
-    """Карточка альбома: заголовок + мета + оценки РЗТ + таблица треков в <code>."""
-    head = f"💿 <b>{esc_html(album.artist)} — {esc_html(album.title)}</b>"
+                   rzt: dict | None = None) -> tuple[str, list]:
+    """Карточка альбома: (текст, entities). Заголовок bold, треки в blockquote, эмодзи РЗТ/тира — кастомные."""
+    b = TextBuilder()
+    b.add("💿 ")
+    b.add(f"{album.artist} — {album.title}", bold=True)
+
     meta = []
     if album.artist:
-        meta.append(f"🎤 {esc_html(album.artist)}")
+        meta.append(f"🎤 {album.artist}")
     date_label = _fmt_release(album.release_date) if album.release_date else album.year
     if date_label:
         meta.append(f"📅 {date_label}")
     if album.genre:
-        meta.append(f"🎧 {esc_html(album.genre)}")
-    line2 = " · ".join(meta)
+        meta.append(f"🎧 {album.genre}")
+    if meta:
+        b.add("\n" + " · ".join(meta))
 
     info = []
     if album.label:
-        info.append(f"🏷 {esc_html(album.label)}")
+        info.append(f"🏷 {album.label}")
     if album.tracks:
         info.append(f"{len(album.tracks)} треков")
     if album.total_duration:
         info.append(fmt_duration_mmss(album.total_duration))
     if album.contributors:
-        info.append(esc_html(", ".join(album.contributors[:2])))
+        info.append(", ".join(album.contributors[:2]))
     line3 = " · ".join(x for x in info if x)
-
-    lines = [head]
-    if line2:
-        lines.append(line2)
     if line3:
-        lines.append(line3)
+        b.add("\n" + line3)
 
     if rzt:
-        bits = []
+        b.add("\n")
         if rzt.get("rzt") is not None:
-            bits.append(f"🎯 РЗТ: {rzt['rzt']}/90")
+            b.add("", emoji_key="rzt")
+            b.add(f" РЗТ: {rzt['rzt']}/90")
         if rzt.get("tier"):
-            bits.append(f"💎 {esc_html(rzt['tier'][0])} {rzt['tier'][1]}")
-        if bits:
-            lines.append(" · ".join(bits))
+            name, val = rzt["tier"]
+            b.add(" · ")
+            tk = tier_key(name)
+            if tk:
+                b.add("", emoji_key=tk)
+            else:
+                b.add("💎")
+            b.add(f" {name} {val}")
+
+    # номинации — сворачиваемый блок (чтобы не перегружать карточку)
+    if rzt and rzt.get("nominations"):
+        b.add("\n")
+        b.open_blockquote(expandable=True)
+        b.add("🏆 Номинации релиза", bold=True)
+        for nom in rzt["nominations"][:6]:
+            b.add("\n")
+            b.add("", emoji_key=result_key(nom.get("result", ""), nom.get("winner", False)))
+            line = f" {nom.get('title', '')}"
+            if nom.get("result"):
+                line += f" — {nom['result']}"
+            if nom.get("period"):
+                line += f" · {nom['period']}"
+            b.add(line)
+        b.close_blockquote()
 
     n = len(album.tracks)
     if n:
         # держим подпись под лимитом Telegram (1024) и по ширине строки (моб. экран)
-        header_len = len("\n".join(lines)) + 20
+        header_len = b.length + 20
         max_rows = max(1, (1000 - header_len) // 30)
         shown = min(n, 18, max_rows)
         rows = []
@@ -169,25 +195,28 @@ def _album_caption(album: AlbumInfo, show_selection: bool = False, selected: set
             dur = fmt_duration_mmss(t.duration) if t.duration else "--:--"
             prefix = f"{mark}{i + 1}. "
             suffix = f" · {dur}"
-            title = crop_text(t.title, max(6, 32 - len(prefix) - len(suffix)))
-            rows.append(f"{prefix}{title}{suffix}")
+            feat = f" (feat. {', '.join(t.feat)})" if t.feat else ""
+            title = crop_text(t.title, max(6, 32 - len(prefix) - len(suffix) - len(feat)))
+            rows.append(f"{prefix}{title}{feat}{suffix}")
         if n > shown:
             rows.append(f"… и ещё {n - shown}")
-        lines.append("<blockquote>" + esc_html("\n".join(rows)) + "</blockquote>")
+        b.add("\n")
+        b.add("\n".join(rows), blockquote=True)
     else:
-        lines.append("<i>Треки недоступны</i>")
+        b.add("\nТреки недоступны", italic=True)
 
     if show_selection:
         k = len(selected) if selected is not None else 0
-        lines.append(f"<i>Отмечено: {k} из {n}</i>")
-    return "\n".join(lines)
+        b.add(f"\nОтмечено: {k} из {n}", italic=True)
+    return b.build()
 
 
 def _mode_label(mode: str) -> str:
     return "VK" if mode == "vk" else "🔀 Uncensored"
 
 
-def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored") -> InlineKeyboardMarkup:
+def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored",
+                   can_alt: bool = False) -> InlineKeyboardMarkup:
     n = len(album.tracks)
     rows = [
         [InlineKeyboardButton(
@@ -196,8 +225,11 @@ def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored") -> In
         )],
         [InlineKeyboardButton(text=f"🎚 Источник: {_mode_label(mode)}", callback_data=f"album_mode|{token}")],
         [InlineKeyboardButton(text="☑️ Выбрать треки", callback_data=f"album_sel|{token}")],
-        [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"album_close|{token}", style="danger")],
+        [InlineKeyboardButton(text="🎛 Источник для каждого", callback_data=f"album_src|{token}")],
     ]
+    if can_alt:
+        rows.append([InlineKeyboardButton(text="🔁 Не тот альбом", callback_data=f"album_alt|{token}")])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data=f"album_close|{token}", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -228,36 +260,42 @@ async def _render_album_view(message: Message, token: str, data: dict) -> None:
     mode = data.get("mode", "uncensored")
     rzt = data.get("rzt")
     if data.get("view") == "select":
+        text, ents = _album_caption(album, show_selection=True, selected=data["selected"], rzt=rzt)
         await _edit_card(
-            message, album,
-            _album_caption(album, show_selection=True, selected=data["selected"], rzt=rzt),
+            message, album, text, ents,
             _select_keyboard(token, album, data["selected"], mode),
         )
     else:
-        await _edit_card(message, album, _album_caption(album, rzt=rzt), _card_keyboard(token, album, mode))
+        text, ents = _album_caption(album, rzt=rzt)
+        can_alt = len(data.get("alternatives") or []) > 1
+        await _edit_card(message, album, text, ents, _card_keyboard(token, album, mode, can_alt))
 
 
-async def _send_card(bot, chat_id: int, album: AlbumInfo, caption: str, kb: InlineKeyboardMarkup):
+async def _send_card(bot, chat_id: int, album: AlbumInfo, caption: str, entities: list, kb: InlineKeyboardMarkup):
     if album.cover_url:
         try:
             return await bot.send_photo(
                 chat_id, photo=album.cover_url, caption=caption,
-                parse_mode=ParseMode.HTML, reply_markup=kb,
+                caption_entities=entities, reply_markup=kb,
             )
         except Exception as e:
             log.warning("album_photo_failed", error=str(e))
-    return await bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    try:
+        return await bot.send_message(chat_id, caption, entities=entities, reply_markup=kb)
+    except Exception:
+        return await bot.send_message(chat_id, caption, reply_markup=kb)
 
 
-async def _edit_card(message: Message, album: AlbumInfo, caption: str, kb: InlineKeyboardMarkup) -> None:
+async def _edit_card(message: Message, album: AlbumInfo, caption: str, entities: list,
+                     kb: InlineKeyboardMarkup) -> None:
     if message.photo:
         try:
-            await message.edit_caption(caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await message.edit_caption(caption=caption, caption_entities=entities, reply_markup=kb)
             return
         except Exception:
             pass
     try:
-        await message.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await message.edit_text(caption, entities=entities, reply_markup=kb)
         return
     except Exception:
         pass
@@ -269,9 +307,14 @@ async def _edit_card(message: Message, album: AlbumInfo, caption: str, kb: Inlin
 
 async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -> None:
     """Фоново: чинит регистр артиста и тянет РЗТ, затем дорисовывает карточку."""
-    casing, rzt = await asyncio.gather(
+    try:
+        await ensure_detected(bot, sent.chat.id)
+    except Exception:
+        pass
+    casing, rzt, feats_added = await asyncio.gather(
         album_service.pretty_artist(album.artist, _ytdlp_proxy, _vk_fetcher),
         rzt_service.get_rating_for(album.artist, album.title),
+        album_service.enrich_with_vk(album, _vk_fetcher),
     )
     data = _pending.get(token)
     if not data or data.get("user_id") != user_id:
@@ -281,58 +324,55 @@ async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -
         album.artist = casing
     if rzt:
         data["rzt"] = rzt
-    if not casing_changed and not rzt:
+    if not casing_changed and not rzt and not feats_added:
         return
     try:
         if data.get("view") == "select":
+            text, ents = _album_caption(album, show_selection=True, selected=data["selected"], rzt=rzt)
             await _edit_card(
-                sent, album,
-                _album_caption(album, show_selection=True, selected=data["selected"], rzt=rzt),
+                sent, album, text, ents,
                 _select_keyboard(token, album, data["selected"], data.get("mode", "uncensored")),
             )
         else:
+            text, ents = _album_caption(album, rzt=rzt)
+            can_alt = len(data.get("alternatives") or []) > 1
             await _edit_card(
-                sent, album,
-                _album_caption(album, rzt=rzt),
-                _card_keyboard(token, album, data.get("mode", "uncensored")),
+                sent, album, text, ents,
+                _card_keyboard(token, album, data.get("mode", "uncensored"), can_alt),
             )
     except Exception:
         pass
-    if rzt and rzt.get("nominations"):
-        nom_lines = "\n".join(f"• {esc_html(n)}" for n in rzt["nominations"])
-        try:
-            await bot.send_message(
-                sent.chat.id,
-                f"🏆 <b>Номинации релиза</b>\n<blockquote expandable>{nom_lines}</blockquote>",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
 
 
-async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user_id: int) -> None:
+async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user_id: int,
+                         alternatives: list | None = None) -> None:
     """Догружает альбом, чинит регистр артиста и сразу показывает карточку (РЗТ — фоном)."""
     _awaiting.pop(user_id, None)
-    full = await album_service.get_album(alb.source, alb.id, _ytdlp_proxy) or alb
+    if alb.source == "vk":
+        full = await album_service.get_album_vk(alb, _vk_fetcher) or alb
+    else:
+        full = await album_service.get_album(alb.source, alb.id, _ytdlp_proxy) or alb
+    alts = alternatives if alternatives is not None else [alb]
 
     token = uuid.uuid4().hex[:8]
     _pending[token] = {
         "user_id": user_id,
         "channel_id": channel_id,
         "album": full,
+        "alternatives": alts,
         "selected": set(range(len(full.tracks))),
         "mode": "uncensored",
         "view": "card",
         "rzt": None,
         "created": time.time(),
     }
-    caption = _album_caption(full)
-    kb = _card_keyboard(token, full, "uncensored")
+    text, ents = _album_caption(full)
+    kb = _card_keyboard(token, full, "uncensored", len(alts) > 1)
     try:
         await message.delete()
     except Exception:
         pass
-    sent = await _send_card(message.bot, message.chat.id, full, caption, kb)
+    sent = await _send_card(message.bot, message.chat.id, full, text, ents, kb)
     if sent is not None:
         asyncio.create_task(_enrich_album(message.bot, sent, token, full, user_id))
 
@@ -387,7 +427,14 @@ async def _show_album_picker(message: Message, albums: list, channel_id: int, us
         header = "💿 <b>Возможно, ты имел в виду — выбери альбом 👇</b>"
     else:
         header = "💿 <b>Нашёл альбомы:</b>\nВыбери нужный 👇"
-    await message.edit_text(header, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        if message.photo:
+            await message.edit_caption(caption=header, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await message.edit_text(header, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        await message.answer(header, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def _start_album_search(message: Message, query: str) -> None:
@@ -417,6 +464,18 @@ async def _start_album_search(message: Message, query: str) -> None:
         log.error("album_search_error", error=str(e))
         albums = []
 
+    if not albums:
+        # Deezer не дал результат/ошибка — пробуем VK
+        try:
+            await status.edit_text(f"💿 Deezer не ответил, ищу в VK: <i>{esc_html(query)}</i>...", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        try:
+            albums = await album_service.search_albums_vk(query, _vk_fetcher)
+        except Exception as e:
+            log.error("album_search_vk_error", error=str(e))
+            albums = []
+
     _cleanup()
     if not albums:
         await status.edit_text(
@@ -424,8 +483,9 @@ async def _start_album_search(message: Message, query: str) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
-    if len(albums) == 1:
-        await _present_album(status, albums[0], channel_id, user_id)
+    # уверенное совпадение — показываем сразу, иначе пикер
+    if len(albums) == 1 or album_service._album_score(query, albums[0]) >= _AUTO_PICK_SCORE:
+        await _present_album(status, albums[0], channel_id, user_id, albums)
         return
     await _show_album_picker(status, albums, channel_id, user_id)
 
@@ -463,7 +523,10 @@ async def cb_album_pick(callback: CallbackQuery):
         await callback.answer("⌛ Устарело — поищите заново.", show_alert=True)
         return
     await callback.answer()
-    await _present_album(callback.message, data["albums"][int(idx)], data["channel_id"], data["user_id"])
+    await _present_album(
+        callback.message, data["albums"][int(idx)], data["channel_id"], data["user_id"],
+        alternatives=data["albums"],
+    )
 
 
 @router.callback_query(F.data.startswith("album_sel|"))
@@ -551,6 +614,22 @@ async def cb_album_back(callback: CallbackQuery):
     await _render_album_view(callback.message, token, data)
 
 
+@router.callback_query(F.data.startswith("album_alt|"))
+async def cb_album_alt(callback: CallbackQuery):
+    """«Не тот альбом» — вернуться к списку найденных вариантов."""
+    token = callback.data.split("|", 1)[1]
+    data = _get(token, callback.from_user.id)
+    if not data or "album" not in data:
+        await callback.answer("⌛ Устарело.", show_alert=True)
+        return
+    alts = data.get("alternatives") or []
+    if len(alts) < 2:
+        await callback.answer("Других вариантов нет.", show_alert=True)
+        return
+    await callback.answer()
+    await _show_album_picker(callback.message, alts, data["channel_id"], data["user_id"])
+
+
 @router.callback_query(F.data == "album_reenter")
 async def cb_album_reenter(callback: CallbackQuery):
     """«Отмена» в списке альбомов — не удаляем, а снова просим ввести название."""
@@ -595,14 +674,16 @@ async def _launch(callback: CallbackQuery, data: dict, tracks: list[Track], name
 
 
 def _album_tracks(album: AlbumInfo, indices=None) -> list[Track]:
-    """Треки альбома с обложкой альбома и форсированными метаданными."""
+    """Треки альбома с обложкой, фитами, VK-ссылкой (если есть) и форсированными метаданными."""
     out = []
     for i, t in enumerate(album.tracks):
         if indices is not None and i not in indices:
             continue
+        title = f"{t.title} (feat. {', '.join(t.feat)})" if t.feat else t.title
         out.append(Track(
-            artist=album.artist, title=t.title, duration=t.duration,
-            cover_url=album.cover_url, force_meta=True,
+            artist=album.artist, title=title, duration=t.duration,
+            url=t.url, source=t.source,
+            cover_url=t.cover_url or album.cover_url, force_meta=True,
         ))
     return out
 
@@ -628,3 +709,26 @@ async def cb_album_dlsel(callback: CallbackQuery):
     album = data["album"]
     selected = data["selected"]
     await _launch(callback, data, _album_tracks(album, selected), f"{album.artist} — {album.title}")
+
+
+@router.callback_query(F.data.startswith("album_src|"))
+async def cb_album_src(callback: CallbackQuery):
+    """«Источник для каждого» — пикер источника/версии по каждому треку альбома."""
+    token = callback.data.split("|", 1)[1]
+    data = _get(token, callback.from_user.id)
+    if not data or "album" not in data:
+        await callback.answer("⌛ Устарело.", show_alert=True)
+        return
+    if playlist.is_user_busy(callback.from_user.id):
+        await callback.answer("⏳ У вас уже выполняется задача. Дождитесь или /cancel.", show_alert=True)
+        return
+    album = data["album"]
+    await callback.answer("🎛 Выбираем источник по трекам…")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await playlist.start_choose_session(
+        callback.message, callback.from_user.id, data["channel_id"],
+        f"{album.artist} — {album.title}", _album_tracks(album),
+    )

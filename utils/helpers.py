@@ -2,7 +2,7 @@
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -17,6 +17,8 @@ class Track:
     cover_url: str = ""       # прямая ссылка на обложку (VK)
     source: str = ""          # "vk" — трек получен из VK (качаем напрямую)
     force_meta: bool = False  # форсировать artist/title в метаданных (напр. из альбома)
+    source_id: str = ""       # id трека в источнике (напр. Deezer track id)
+    feat: list[str] = field(default_factory=list)  # featured-артисты
 
 
 def parse_track_line(line: str) -> Optional[Track]:

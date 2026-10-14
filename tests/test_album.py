@@ -133,8 +133,8 @@ def test_album_tracks_force_meta_and_cover():
 def test_query_variants_with_translit():
     variants = _query_variants("салуки эйфория")
     assert variants[0] == "салуки эйфория"
-    assert "saluki" in variants          # слово-артист (Deezer по нему находит альбом)
-    assert "eyforiya" in variants
+    assert "saluki eyforiya" in variants
+    assert "saluki" in variants
     assert len(variants) <= 4
 
 
@@ -153,12 +153,41 @@ def test_album_caption_keeps_duration_visible():
             Track(artist="VILLIAN", title="Короткий", duration=127),
         ],
     )
-    cap = _album_caption(album)
-    assert "<blockquote>" in cap and "</blockquote>" in cap
-    lines = [
-        ln.replace("<blockquote>", "").replace("</blockquote>", "")
-        for ln in cap.splitlines() if " · " in ln
-    ]
+    cap, ents = _album_caption(album)
+    lines = [ln for ln in cap.splitlines() if " · " in ln]
     assert len(lines) == 2
     assert "1:44" in lines[0] and "2:07" in lines[1]
     assert all(len(ln) <= 32 for ln in lines)
+
+
+def test_album_caption_shows_feat():
+    album = AlbumInfo(
+        source="deezer", id="1", artist="SALUKI", title="EUPHORIA",
+        tracks=[Track(artist="SALUKI", title="weekend", duration=200, feat=["Sabu"])],
+    )
+    cap, _ = _album_caption(album)
+    assert "(feat. Sabu)" in cap
+
+
+def test_album_tracks_feat_in_title():
+    album = AlbumInfo(
+        source="deezer", id="1", artist="SALUKI", title="EUPHORIA",
+        tracks=[Track(artist="SALUKI", title="weekend", duration=200, feat=["Sabu"])],
+    )
+    tracks = _album_tracks(album)
+    assert tracks[0].title == "weekend (feat. Sabu)"
+
+
+def test_norm_title_matches_case_and_punct():
+    from services.album import _norm_title
+
+    assert _norm_title("L. O. LUX") == _norm_title("l o lux")
+    assert _norm_title("GOOD FCK") == "good fck"
+
+
+def test_split_artists():
+    from services.album import _split_artists
+
+    assert _split_artists("SALUKI, Sabu") == ("SALUKI", ["Sabu"])
+    assert _split_artists("SALUKI") == ("SALUKI", [])
+    assert _split_artists("SALUKI feat. Joviee") == ("SALUKI", ["Joviee"])

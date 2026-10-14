@@ -23,14 +23,18 @@ def _is_auth_error(err: object) -> bool:
     )
 
 
-def _cover_from_item(item: dict) -> str:
-    """Достаёт URL обложки альбома из элемента audio.get."""
-    album = item.get("album") or {}
-    thumb = album.get("thumb") or {}
-    for key in ("photo_1200", "photo_600", "photo_300", "photo_270", "photo"):
+def _thumb_url(thumb: dict) -> str:
+    """Достаёт наибольший URL обложки из album.thumb."""
+    for key in ("photo_1200", "photo_600", "photo_300", "photo_270", "photo_135", "photo_68", "photo_34"):
         if thumb.get(key):
             return thumb[key]
     return ""
+
+
+def _cover_from_item(item: dict) -> str:
+    """Достаёт URL обложки альбома из элемента audio.get."""
+    album = item.get("album") or {}
+    return _thumb_url(album.get("thumb") or {})
 
 
 class VKFetcher:
@@ -244,6 +248,63 @@ class VKFetcher:
         """Асинхронная обёртка поиска."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.search, query, count)
+
+    def search_albums(self, query: str, count: int = 100) -> List[dict]:
+        """Ищет аудио и группирует по album.id (VK-релизы). Группы-кандидаты альбомов.
+
+        Каждая группа: owner_id, album_id, access_key, title, cover_url, artists, tracks.
+        """
+        self._ensure_session()
+        try:
+            response = self._api.audio.search(q=query, count=count)
+            self.last_error = ""
+        except vk_api.exceptions.ApiError as e:
+            self.last_error = str(e)
+            if _is_auth_error(e):
+                self.auth_failed = True
+            log.warning("vk_album_search_error", query=query, error=str(e))
+            return []
+        except Exception as e:
+            self.last_error = str(e)
+            log.warning("vk_album_search_error", query=query, error=str(e))
+            return []
+
+        items = response.get("items", []) if isinstance(response, dict) else []
+        groups: dict[str, dict] = {}
+        for item in items:
+            album = item.get("album") or {}
+            aid = album.get("id")
+            if not aid:
+                continue
+            owner = album.get("owner_id")
+            key = f"{owner}_{aid}"
+            g = groups.get(key)
+            if g is None:
+                g = {
+                    "owner_id": owner,
+                    "album_id": aid,
+                    "access_key": album.get("access_key") or "",
+                    "title": (album.get("title") or "").strip(),
+                    "cover_url": _thumb_url(album.get("thumb") or {}),
+                    "artists": [],
+                    "tracks": [],
+                }
+                groups[key] = g
+            title = (item.get("title") or "").strip()
+            artist = (item.get("artist") or "").strip()
+            if title:
+                g["tracks"].append({"artist": artist, "title": title, "duration": item.get("duration") or 0})
+            main = artist.split(",")[0].strip() if artist else ""
+            if main and main not in g["artists"]:
+                g["artists"].append(main)
+
+        out = sorted(groups.values(), key=lambda grp: len(grp["tracks"]), reverse=True)
+        log.info("vk_albums_search_done", query=query, groups=len(out))
+        return out
+
+    async def search_albums_async(self, query: str, count: int = 100) -> List[dict]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.search_albums, query, count)
 
     def get_track(self, owner_id: int, audio_id: int, access_key: Optional[str] = None) -> Optional[Track]:
         """Получает одиночный трек по (owner_id, audio_id) через audio.getById."""
