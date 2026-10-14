@@ -479,6 +479,7 @@ async def process_playlist(
     mode: str = "uncensored",
     concurrency: int = 3,
     cover_url: str = "",
+    channel_header: bool = True,
 ) -> str:
     task_id = str(uuid.uuid4())[:8]
     status = TaskStatus(
@@ -495,7 +496,7 @@ async def process_playlist(
         _process_tracks(
             status, tracks, bot, cache_mgr, rate_limit,
             playlist_name, total_duration, source_order or ["youtube", "soundcloud"], ytdlp_proxy, mode,
-            concurrency, cover_url,
+            concurrency, cover_url, channel_header,
         )
     )
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
@@ -666,6 +667,7 @@ async def _process_tracks(
     mode: str = "uncensored",
     concurrency: int = 1,
     cover_url: str = "",
+    channel_header: bool = True,
 ) -> None:
     """Внутренний цикл обработки треков (последовательно или пулом воркеров)."""
     sender = TelegramSender(bot)
@@ -689,7 +691,7 @@ async def _process_tracks(
         except Exception as e:
             log.error("status_message_send_error", error=str(e))
 
-        if playlist_name or total_duration:
+        if channel_header and (playlist_name or total_duration):
             duration_str = format_duration(total_duration) if total_duration else "?"
             if cover_url:
                 try:
@@ -721,6 +723,9 @@ async def _process_tracks(
                     track, status.channel_id, cache_mgr, sender, source_order, ytdlp_proxy, mode,
                     status.user_id, cancel=lambda: status.cancelled,
                 )
+                if result == "cancelled":
+                    log.info("task_stopped_by_user", task_id=status.task_id, processed=status.processed)
+                    break
                 _apply_result(status, track, result)
                 await _edit_status(bot, status)
 
@@ -746,6 +751,9 @@ async def _process_tracks(
                     except Exception as e:
                         log.error("track_worker_error", error=str(e), title=track.title)
                         result = "error"
+
+                    if result == "cancelled":
+                        return
 
                     async with lock:
                         status.processed += 1
@@ -861,7 +869,7 @@ async def _download_vk_media(
     if cover_url:
         raw = os.path.join(work_dir, "cover")
         if await download_image(cover_url, raw, ""):
-            if make_thumbnail(raw, final_cover):
+            if await asyncio.to_thread(make_thumbnail, raw, final_cover):
                 cover_path = final_cover
     return final_mp3, cover_path
 
@@ -892,12 +900,16 @@ async def _download_and_send(
     """
     work_dir = tempfile.mkdtemp(dir=cache_mgr.cache_dir, prefix="work_")
     bitrate = 0
+    download_s = 0.0
+    cover_s = 0.0
     try:
         if cand.source == "vk":
+            t_dl = time.time()
             final_mp3, cover_path = await _download_vk_media(
-                cand.url, cand.cover_url, work_dir, cache_mgr, hash_key, ytdlp_proxy,
+                cand.url, cand.cover_url or vk_cover_url, work_dir, cache_mgr, hash_key, ytdlp_proxy,
                 cand.artist, cand.title, cancel=cancel,
             )
+            download_s = time.time() - t_dl
             if not final_mp3:
                 return None
             disp_artist = (cand.artist or artist_hint or "Unknown Artist").strip()
@@ -910,11 +922,21 @@ async def _download_and_send(
                 except OSError:
                     bitrate = 0
         else:
+            raw_vk = os.path.join(work_dir, "cover_vk")
+            # обложка известна заранее (альбом) — качаем параллельно с аудио
+            cover_task = (
+                asyncio.create_task(download_image(vk_cover_url, raw_vk, ""))
+                if vk_cover_url else None
+            )
+            t_dl = time.time()
             dr = await download_audio_async(
                 cand.url, work_dir, "audio", ytdlp_proxy, cand.source, cancel=cancel,
             )
             if not dr or not dr.file_path:
+                if cover_task is not None:
+                    await asyncio.gather(cover_task, return_exceptions=True)
                 return None
+            download_s = time.time() - t_dl
 
             final_mp3 = cache_mgr._file_path(hash_key)
             if os.path.exists(final_mp3):
@@ -929,24 +951,31 @@ async def _download_and_send(
             source_url = dr.source_url
             bitrate = dr.bitrate
 
+            t_cov = time.time()
             cover_path = ""
             final_cover = cache_mgr._cover_path(hash_key)
             got_cover = False
             cover_origin = "none"
-            # 1. VK-обложка: из плейлиста или найденная в VK при хорошем совпадении
-            vk_cover = vk_cover_url or await asyncio.to_thread(_fetch_vk_cover, disp_artist, disp_title)
-            if vk_cover:
-                raw_vk = os.path.join(work_dir, "cover_vk")
-                if await download_image(vk_cover, raw_vk, ""):
-                    if make_thumbnail(raw_vk, final_cover):
+            # 1. Обложка VK/альбома (заранее скачанная или найденная в VK)
+            vk_ok = await cover_task if cover_task is not None else False
+            if vk_ok:
+                if await asyncio.to_thread(make_thumbnail, raw_vk, final_cover):
+                    cover_path = final_cover
+                    got_cover = True
+                    cover_origin = "vk"
+            elif not vk_cover_url:
+                vk_cover = await asyncio.to_thread(_fetch_vk_cover, disp_artist, disp_title)
+                if vk_cover and await download_image(vk_cover, raw_vk, ""):
+                    if await asyncio.to_thread(make_thumbnail, raw_vk, final_cover):
                         cover_path = final_cover
                         got_cover = True
                         cover_origin = "vk"
             # 2. Обложка самого источника (SoundCloud/YouTube)
             if not got_cover and dr.cover_path:
-                if make_thumbnail(dr.cover_path, final_cover):
+                if await asyncio.to_thread(make_thumbnail, dr.cover_path, final_cover):
                     cover_path = final_cover
                     cover_origin = "source"
+            cover_s = time.time() - t_cov
             log.info("cover_resolved", track=disp_title[:40], origin=cover_origin)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -962,9 +991,15 @@ async def _download_and_send(
         or f"{disp_artist} {disp_title}".strip()
     )
     redo_kb = _redo_keyboard(redo_query, channel_id, user_id)
+    t_send = time.time()
     res = await sender.send_file(
         channel_id, final_mp3, send_track,
         cover=cover_path or None, reply_markup=redo_kb, caption=_build_caption(source_url),
+    )
+    send_s = time.time() - t_send
+    log.info(
+        "track_io", title=disp_title[:30], source=cand.source,
+        download_s=round(download_s, 1), cover_s=round(cover_s, 1), send_s=round(send_s, 1),
     )
 
     cache_mgr.save(hash_key, {
@@ -1152,6 +1187,9 @@ async def _process_single_track(
     vk_available = track.source == "vk" and bool(track.url)
     _bump(total_tracks=1)
 
+    if cancel is not None and cancel():
+        return "cancelled"
+
     # --- кэш ---
     cached = cache_mgr.get(hash_key)
     if cached:
@@ -1207,6 +1245,8 @@ async def _process_single_track(
             if info:
                 log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
                 return "sent_new"
+            if cancel is not None and cancel():
+                return "cancelled"
         log.warning("vk_direct_failed_fallback_search", artist=track.artist, title=track.title)
 
     # --- поиск по источникам ---
@@ -1234,10 +1274,14 @@ async def _process_single_track(
 
     try:
         # ищем во всех источниках параллельно, а качаем по приоритету
+        t_search = time.time()
         found = await asyncio.gather(*(_search_src(s) for s in sources))
+        search_s = time.time() - t_search
         by_source = dict(zip(sources, found))
 
         for source_name in sources:
+            if cancel is not None and cancel():
+                return "cancelled"
             candidates = by_source.get(source_name) or []
             ranked = rank_candidates(candidates, query, track.duration, artist_hint, limit=3)
             if not ranked:
@@ -1258,10 +1302,13 @@ async def _process_single_track(
                 )
                 if info:
                     log.info("track_sent", source=info["source"], display=f"{info['artist']} - {info['title']}")
+                    log.info("track_timing", title=track.title[:30], search_s=round(search_s, 1))
                     return "sent_new"
+                if cancel is not None and cancel():
+                    return "cancelled"
 
         # Fallback: ничего не нашли в uncensored-источниках → отдаём версию из VK
-        if mode != "vk" and vk_available:
+        if mode != "vk" and vk_available and not (cancel is not None and cancel()):
             info = await _download_vk_and_send(
                 track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
                 (track.artist, track.title) if track.force_meta else None, cancel=cancel,

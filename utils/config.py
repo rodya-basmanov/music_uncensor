@@ -33,7 +33,7 @@ class Config:
 
     # Playlist processing
     max_playlist_size: int = 500
-    concurrency: int = 4
+    concurrency: int = 3
     send_interval: float = 1.0
 
     # Audio caption (song.link + via @bot)
@@ -88,7 +88,7 @@ def load_config() -> Config:
         source_order=source_order or ["youtube", "soundcloud"],
 
         max_playlist_size=int(os.getenv("MAX_PLAYLIST_SIZE", "500")),
-        concurrency=max(1, int(os.getenv("CONCURRENCY", "4"))),
+        concurrency=max(1, int(os.getenv("CONCURRENCY", "3"))),
         send_interval=max(0.0, float(os.getenv("SEND_INTERVAL", "1"))),
         audio_caption=_env_bool("AUDIO_CAPTION", True),
         via_username=os.getenv("VIA_USERNAME", ""),

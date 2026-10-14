@@ -225,6 +225,14 @@ def parse_search_output(stdout: str, source: str) -> List[Candidate]:
     return results
 
 
+def _fragments() -> int:
+    """Сколько фрагментов качать параллельно (env YTDLP_FRAGMENTS, дефолт 4)."""
+    try:
+        return max(1, int(os.environ.get("YTDLP_FRAGMENTS", "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
 def _download_args(
     url: str, dest_dir: str, out_stem: str, proxy: str, embed_thumb: bool,
 ) -> tuple[List[str], str, str]:
@@ -244,7 +252,7 @@ def _download_args(
     args = [
         "--force-overwrites",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--concurrent-fragments", "8",
+        "--concurrent-fragments", str(_fragments()),
         "--paths", dest_dir,
         "--output", out_tmpl,
         "--no-simulate",
@@ -359,7 +367,10 @@ async def download_audio_async(
     args, _, _ = _download_args(url, dest_dir, out_stem, proxy, embed_thumb)
     res = await run_ytdlp_async(args, timeout=180, cancel=cancel)
     if res is None:
-        log.warning("download_cancelled_or_timeout", url=url, source=source)
+        if cancel is not None and cancel():
+            log.debug("download_cancelled", url=url[:80], source=source)
+        else:
+            log.warning("download_timeout_or_error", url=url, source=source)
         return None
     _, out, err = res
     return _collect_download(dest_dir, out_stem, url, source, out, err)
