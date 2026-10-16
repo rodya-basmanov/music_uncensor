@@ -189,17 +189,32 @@ async def run_ytdlp_async(
                 out, err = comm.result()
                 return int(proc.returncode or 0), out.decode("utf-8", "ignore"), err.decode("utf-8", "ignore")
             if (cancel is not None and cancel()) or loop.time() > deadline:
-                proc.kill()
-                await asyncio.gather(comm, return_exceptions=True)
                 return None
+    except asyncio.CancelledError:
+        log.info("ytdlp_cancelled")
+        raise
     except Exception as e:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        await asyncio.gather(comm, return_exceptions=True)
         log.warning("ytdlp_async_error", error=str(e))
         return None
+    finally:
+        # Гарантированно убиваем процесс и ждём его — в т.ч. при CancelledError,
+        # который не ловится except Exception (это BaseException в Python 3.8+).
+        await _terminate_proc(proc, comm)
+
+
+async def _terminate_proc(proc: "asyncio.subprocess.Process", comm: "asyncio.Future") -> None:
+    """Убивает процесс yt-dlp (если жив) и корректно дожидается его завершения."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        except Exception:
+            pass
+    try:
+        await asyncio.shield(asyncio.gather(comm, return_exceptions=True))
+    except asyncio.CancelledError:
+        pass
 
 
 def parse_search_output(stdout: str, source: str) -> List[Candidate]:

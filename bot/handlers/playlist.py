@@ -31,6 +31,7 @@ from services.processor import (
     process_playlist,
     search_all,
 )
+from utils.callback import parse_cb, to_int
 from utils.escape import esc_html, esc_md
 from utils.helpers import (
     Track,
@@ -38,9 +39,11 @@ from utils.helpers import (
     clean_title_for_search,
     crop_text,
     parse_track_line,
+    read_text_file,
 )
 from utils.links import find_youtube_link
 from utils.logger import get_logger
+from utils.pending import PendingStore, sweep_all
 from utils.rich import edit_rich
 from utils.storage import UserStorage
 from utils.ui import fmt_duration_mmss, is_mashup, source_icon, version_tag
@@ -57,23 +60,23 @@ _rate_limit: float = 2.0
 _source_order: list[str] = ["youtube", "soundcloud"]
 _ytdlp_proxy: str = ""
 _vk_token: str = ""
+_vk_fetcher: VKFetcher | None = None
 _vk_playlist_mode: str = "ask"
 _concurrency: int = 3
 
 # Интерактивный выбор результатов
-_pending_picks: dict[str, dict] = {}
-_PICK_TTL = 20 * 60
+_pending_picks = PendingStore(ttl=20 * 60)
 _PICK_PAGE_SIZE = 8
 _PICK_MAX = 40
 
 # Меню режима для VK-плейлиста
-_vk_menu_pending: dict[str, dict] = {}
+_vk_menu_pending = PendingStore(ttl=20 * 60)
 
-# Поиск по тексту песни: token -> {user_id, channel_id, text, songs, created}
-_lyric_pending: dict[str, dict] = {}
+# Поиск по тексту песни: token -> {user_id, channel_id, text, songs}
+_lyric_pending = PendingStore(ttl=20 * 60)
 
 # Сессии «Выбирать каждый трек»: user_id -> {...}
-_pick_sessions: dict[int, dict] = {}
+_pick_sessions = PendingStore(ttl=2 * 3600, touch=True)
 
 _FILTERS = ("all", "youtube", "soundcloud", "vk")
 
@@ -91,7 +94,7 @@ def set_dependencies(
 ) -> None:
     """Устанавливает зависимости (вызывается при инициализации бота)."""
     global _cache_mgr, _storage, _max_playlist_size, _rate_limit
-    global _source_order, _ytdlp_proxy, _vk_token, _vk_playlist_mode, _concurrency
+    global _source_order, _ytdlp_proxy, _vk_token, _vk_fetcher, _vk_playlist_mode, _concurrency
     _cache_mgr = cache_mgr
     _storage = storage
     _max_playlist_size = max_playlist_size
@@ -99,6 +102,7 @@ def set_dependencies(
     _source_order = source_order or ["youtube", "soundcloud"]
     _ytdlp_proxy = ytdlp_proxy
     _vk_token = vk_token
+    _vk_fetcher = VKFetcher(vk_token) if vk_token else None
     _vk_playlist_mode = (vk_playlist_mode or "ask").lower()
     _concurrency = max(1, concurrency)
 
@@ -167,19 +171,21 @@ def _resolve_target_channel(message: Message, channel_hint: str | None) -> int |
 
 
 async def _fetch_vk_playlist(ref) -> list[Track]:
-    fetcher = VKFetcher(_vk_token)
-    return await fetcher.get_playlist_tracks_async(
+    if _vk_fetcher is None:
+        return []
+    return await _vk_fetcher.get_playlist_tracks_async(
         ref.owner_id, ref.playlist_id, ref.access_key, count=_max_playlist_size,
     )
 
 
 async def _fetch_vk_track(ref) -> Track | None:
-    fetcher = VKFetcher(_vk_token)
-    return await fetcher.get_track_async(ref.owner_id, ref.audio_id, ref.access_key)
+    if _vk_fetcher is None:
+        return None
+    return await _vk_fetcher.get_track_async(ref.owner_id, ref.audio_id, ref.access_key)
 
 
 # кнопка «найти варианты» после прямой ссылки: token -> {query, channel_id, user_id}
-_reopen_pending: dict[str, dict] = {}
+_reopen_pending = PendingStore(ttl=3600)
 
 
 async def _send_direct(message: Message, cand: Candidate, label: str, user_id: int | None = None) -> None:
@@ -252,13 +258,7 @@ async def _handle_youtube_link(message: Message, url: str) -> None:
 # ----------------------------- пикер ----------------------------------------
 
 def _cleanup_picks() -> None:
-    now = time.time()
-    for tok in [t for t, v in _pending_picks.items() if now - v["created"] > _PICK_TTL]:
-        _pending_picks.pop(tok, None)
-    for tok in [t for t, v in _vk_menu_pending.items() if now - v["created"] > _PICK_TTL]:
-        _vk_menu_pending.pop(tok, None)
-    for tok in [t for t, v in _lyric_pending.items() if now - v["created"] > _PICK_TTL]:
-        _lyric_pending.pop(tok, None)
+    sweep_all()
 
 
 _FILTER_LABEL = {"all": "🔀 Все", "youtube": "▶️ YouTube", "soundcloud": "☁️ SoundCloud", "vk": "VK"}
@@ -532,21 +532,26 @@ async def _show_lyric_stage(message: Message, text: str, channel_id: int, user_i
 @router.callback_query(F.data.startswith("lyricpick|"))
 async def cb_lyric_pick(callback: CallbackQuery):
     """Стадия 2: пользователь подтвердил песню — ищем её по всем источникам."""
-    try:
-        _, token, idx = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "lyricpick|", 2)
+    if args is None:
         await callback.answer("Ошибка данных.", show_alert=True)
         return
+    token, idx = args
 
-    data = _lyric_pending.pop(token, None)
+    data = _lyric_pending.get(token)
     if not data:
         await callback.answer("⌛ Устарело — пришлите текст заново.", show_alert=True)
         return
     if callback.from_user.id != data["user_id"]:
         await callback.answer("Это не ваш поиск.", show_alert=True)
         return
+    _lyric_pending.pop(token, None)
 
-    artist, title = data["songs"][int(idx)]
+    i = to_int(idx)
+    if i is None or not (0 <= i < len(data["songs"])):
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    artist, title = data["songs"][i]
     resolved = f"{artist} {title}".strip() or data["text"]
     note = f"🎤 по тексту → {artist} — {title}" if artist else f"🎤 по тексту → {title}"
     await callback.answer("🔎 Ищу трек…")
@@ -652,6 +657,9 @@ async def handle_playlist_file(message: Message):
     if not all([_cache_mgr, _storage]):
         await message.answer("⚠️ Бот не полностью инициализирован. Попробуйте позже.")
         return
+    if document.file_size and document.file_size > 5 * 1024 * 1024:
+        await message.answer("❌ Файл слишком большой (макс. 5 МБ).")
+        return
 
     playlist_name = None
     if message.caption:
@@ -664,8 +672,7 @@ async def handle_playlist_file(message: Message):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
             tmp_path = tmp.name
         await message.bot.download(document.file_id, destination=tmp_path)
-        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
+        content = read_text_file(tmp_path)
     except Exception as e:
         log.error("file_download_error", error=str(e))
         await message.answer("❌ Ошибка при скачивании файла.")
@@ -677,8 +684,8 @@ async def handle_playlist_file(message: Message):
             except OSError:
                 pass
 
-    if find_vk_link(content):
-        vk_link = find_vk_link(content)
+    vk_link = find_vk_link(content)
+    if vk_link:
         track_ref = parse_vk_track_link(vk_link)
         if track_ref:
             await _handle_vk_track(message, track_ref)
@@ -825,13 +832,16 @@ async def _handle_vk_link(message: Message, text: str, playlist_name: str | None
 @router.callback_query(F.data.startswith("vkmode|"))
 async def cb_vk_mode(callback: CallbackQuery):
     """Выбор режима обработки VK-плейлиста."""
-    try:
-        _, token, mode = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "vkmode|", 2)
+    if args is None:
+        await callback.answer()
+        return
+    token, mode = args
+    if mode not in ("uncensored", "vk", "pick"):
         await callback.answer()
         return
 
-    data = _vk_menu_pending.pop(token, None)
+    data = _vk_menu_pending.get(token)
     if not data:
         await callback.answer("⌛ Меню устарело — пришлите ссылку заново.", show_alert=True)
         return
@@ -846,6 +856,8 @@ async def cb_vk_mode(callback: CallbackQuery):
         await callback.answer("⏳ Уже выполняется задача. Дождитесь или /cancel.", show_alert=True)
         return
 
+    # Меню «съедаем» только после всех проверок, иначе чужой клик его уничтожит.
+    _vk_menu_pending.pop(token, None)
     await callback.answer()
 
     if mode in ("uncensored", "vk"):
@@ -974,11 +986,11 @@ async def _continue_choose(base_message: Message, user_id: int, next_index: int)
 @router.callback_query(F.data.startswith("pick|"))
 async def cb_pick(callback: CallbackQuery):
     """Пользователь выбрал трек."""
-    try:
-        _, token, gi = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "pick|", 2)
+    if args is None:
         await callback.answer("Ошибка данных.", show_alert=True)
         return
+    token, gi = args
 
     data = _pending_picks.get(token)
     if not data:
@@ -988,7 +1000,11 @@ async def cb_pick(callback: CallbackQuery):
         await callback.answer("Это не ваш поиск.", show_alert=True)
         return
 
-    cand = data["all"][int(gi)]
+    gi_int = to_int(gi)
+    if gi_int is None or not (0 <= gi_int < len(data["all"])):
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    cand = data["all"][gi_int]
     await callback.answer("⏳ Скачиваю...")
     try:
         await callback.message.edit_text(f"⏳ Скачиваю: <i>{cand.title[:60]}</i>...", parse_mode=ParseMode.HTML)
@@ -1070,10 +1086,16 @@ async def cb_pick(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("fix|"))
 async def cb_fix(callback: CallbackQuery):
     """Кнопка «Не тот трек» под аудио в канале — удалить его и открыть варианты в ЛС."""
-    token = callback.data.split("|", 1)[1]
-    data = get_redo(token)
+    args = parse_cb(callback.data, "fix|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = get_redo(args[0])
     if not data:
         await callback.answer("⌛ Устарело — пришлите запрос заново.", show_alert=True)
+        return
+    if callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш трек.", show_alert=True)
         return
     try:
         await callback.message.delete()
@@ -1089,8 +1111,11 @@ async def cb_fix(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("redo|"))
 async def cb_redo(callback: CallbackQuery):
     """Вернуться к результатам и выбрать другой вариант."""
-    token = callback.data.split("|", 1)[1]
-    data = _pending_picks.get(token)
+    args = parse_cb(callback.data, "redo|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _pending_picks.get(args[0])
     if not data:
         await callback.answer("⌛ Устарело — поищите заново.", show_alert=True)
         return
@@ -1098,14 +1123,17 @@ async def cb_redo(callback: CallbackQuery):
         await callback.answer("Это не ваш поиск.", show_alert=True)
         return
     await callback.answer()
-    await _render_picker(callback.message, token, data, data.get("page", 0))
+    await _render_picker(callback.message, args[0], data, data.get("page", 0))
 
 
 @router.callback_query(F.data.startswith("retry|"))
 async def cb_retry(callback: CallbackQuery):
     """Кнопка «🔁 Докачать не найденные» из финального статуса."""
-    token = callback.data.split("|", 1)[1]
-    data = get_retry(token)
+    args = parse_cb(callback.data, "retry|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = get_retry(args[0])
     if not data:
         await callback.answer("⌛ Список устарел — начните заново.", show_alert=True)
         return
@@ -1131,11 +1159,18 @@ async def cb_retry(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("next_track|"))
 async def cb_next_track(callback: CallbackQuery):
     """Перейти к следующему треку (режим выбора)."""
-    token = callback.data.split("|", 1)[1]
-    data = _pending_picks.pop(token, None)
+    args = parse_cb(callback.data, "next_track|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _pending_picks.get(args[0])
     if not data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
+    if callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш поиск.", show_alert=True)
+        return
+    _pending_picks.pop(args[0], None)
     await callback.answer()
     await _continue_choose(callback.message, data["pk_session"], data["pk_index"] + 1)
 
@@ -1143,8 +1178,15 @@ async def cb_next_track(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pickclose|"))
 async def cb_pick_close(callback: CallbackQuery):
     """Закрыть выбор (убрать кнопки)."""
-    token = callback.data.split("|", 1)[1]
-    _pending_picks.pop(token, None)
+    args = parse_cb(callback.data, "pickclose|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _pending_picks.get(args[0])
+    if data and callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш поиск.", show_alert=True)
+        return
+    _pending_picks.pop(args[0], None)
     await callback.answer("Готово")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1155,14 +1197,18 @@ async def cb_pick_close(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("reopen|"))
 async def cb_reopen(callback: CallbackQuery):
     """По прямой ссылке — открыть поиск вариантов."""
-    token = callback.data.split("|", 1)[1]
-    data = _reopen_pending.pop(token, None)
+    args = parse_cb(callback.data, "reopen|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _reopen_pending.get(args[0])
     if not data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
     if callback.from_user.id != data["user_id"]:
         await callback.answer("Это не ваш поиск.", show_alert=True)
         return
+    _reopen_pending.pop(args[0], None)
     await callback.answer()
     await _show_picker(callback.message, data["query"], data["channel_id"], user_id=callback.from_user.id)
 
@@ -1170,17 +1216,20 @@ async def cb_reopen(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pickfilter|"))
 async def cb_pick_filter(callback: CallbackQuery):
     """Переключение фильтра источника."""
-    try:
-        _, token, filt = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "pickfilter|", 2)
+    if args is None:
         await callback.answer()
         return
+    token, filt = args
     data = _pending_picks.get(token)
     if not data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
     if callback.from_user.id != data["user_id"]:
         await callback.answer("Это не ваш поиск.", show_alert=True)
+        return
+    if filt not in _FILTERS:
+        await callback.answer()
         return
 
     data["filter"] = filt
@@ -1192,11 +1241,11 @@ async def cb_pick_filter(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pickpage|"))
 async def cb_pick_page(callback: CallbackQuery):
     """Листание страниц."""
-    try:
-        _, token, filt, page = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "pickpage|", 3)
+    if args is None:
         await callback.answer()
         return
+    token, filt, page = args
     data = _pending_picks.get(token)
     if not data:
         await callback.answer("⌛ Устарело.", show_alert=True)
@@ -1204,11 +1253,15 @@ async def cb_pick_page(callback: CallbackQuery):
     if callback.from_user.id != data["user_id"]:
         await callback.answer("Это не ваш поиск.", show_alert=True)
         return
+    p = to_int(page)
+    if filt not in _FILTERS or p is None or p < 0:
+        await callback.answer()
+        return
 
     data["filter"] = filt
-    data["page"] = int(page)
+    data["page"] = p
     await callback.answer()
-    await _render_picker(callback.message, token, data, int(page))
+    await _render_picker(callback.message, token, data, p)
 
 
 @router.callback_query(F.data == "noop")
@@ -1219,8 +1272,15 @@ async def cb_noop(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pickcancel|"))
 async def cb_pick_cancel(callback: CallbackQuery):
     """Отмена."""
-    token = callback.data.split("|", 1)[1]
-    data = _pending_picks.pop(token, None)
+    args = parse_cb(callback.data, "pickcancel|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _pending_picks.get(args[0])
+    if data and callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш поиск.", show_alert=True)
+        return
+    _pending_picks.pop(args[0], None)
     if data and data.get("pk_session") is not None:
         _pick_sessions.pop(data["pk_session"], None)
     await callback.answer("Отменено")
@@ -1235,15 +1295,23 @@ async def cb_pick_cancel(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pk_auto|"))
 async def cb_pk_auto(callback: CallbackQuery):
     """«Авто для остальных» — обработать оставшиеся треки автоматически."""
-    token = callback.data.split("|", 1)[1]
-    data = _pending_picks.pop(token, None)
+    args = parse_cb(callback.data, "pk_auto|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _pending_picks.get(args[0])
     if not data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    session = _pick_sessions.pop(data["pk_session"], None)
+    if callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш выбор.", show_alert=True)
+        return
+    session = _pick_sessions.get(data["pk_session"])
     if not session:
         await callback.answer("Сессия завершена.", show_alert=True)
         return
+    _pending_picks.pop(args[0], None)
+    _pick_sessions.pop(data["pk_session"], None)
 
     remaining = session["tracks"][data["pk_index"]:]
     await callback.answer()
@@ -1261,11 +1329,18 @@ async def cb_pk_auto(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pk_skip|"))
 async def cb_pk_skip(callback: CallbackQuery):
     """Пропустить текущий трек в режиме выбора."""
-    token = callback.data.split("|", 1)[1]
-    data = _pending_picks.pop(token, None)
+    args = parse_cb(callback.data, "pk_skip|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    data = _pending_picks.get(args[0])
     if not data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
+    if callback.from_user.id != data["user_id"]:
+        await callback.answer("Это не ваш выбор.", show_alert=True)
+        return
+    _pending_picks.pop(args[0], None)
     await callback.answer("Пропущено")
     try:
         await callback.message.edit_text("⏭ Пропущено.")
@@ -1277,8 +1352,12 @@ async def cb_pk_skip(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("pk_skip_track|"))
 async def cb_pk_skip_track(callback: CallbackQuery):
     """Пропустить трек, для которого ничего не нашлось (по user_id)."""
-    user_id = int(callback.data.split("|", 1)[1])
-    if callback.from_user.id != user_id:
+    args = parse_cb(callback.data, "pk_skip_track|", 1)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    user_id = to_int(args[0])
+    if user_id is None or callback.from_user.id != user_id:
         await callback.answer("Это не ваш выбор.", show_alert=True)
         return
     await callback.answer("Пропущено")

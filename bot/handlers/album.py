@@ -14,11 +14,15 @@ from bot.handlers import playlist
 from services import album as album_service
 from services import rzt as rzt_service
 from services.album import AlbumInfo
+from utils.callback import parse_cb, to_int
 from utils.emoji import TextBuilder, ensure_detected, result_key, tier_key
 from utils.escape import esc_html
 from utils.helpers import Track, crop_text
 from utils.logger import get_logger
+from utils.pending import PendingStore
+from utils.safe import edit_or_send, safe_edit
 from utils.storage import UserStorage
+from utils.tasks import spawn
 from utils.ui import fmt_duration_mmss
 
 log = get_logger("album_handler")
@@ -29,8 +33,7 @@ _storage: UserStorage | None = None
 _ytdlp_proxy: str = ""
 _vk_fetcher = None
 
-_PENDING_TTL = 20 * 60
-_pending: dict[str, dict] = {}
+_pending = PendingStore(ttl=20 * 60)
 
 # Пользователи, ожидающие ввод названия альбома: user_id -> expiry
 _awaiting: dict[int, float] = {}
@@ -87,9 +90,7 @@ def set_dependencies(storage: UserStorage, ytdlp_proxy: str = "", vk_token: str 
 
 
 def _cleanup() -> None:
-    now = time.time()
-    for tok in [t for t, v in _pending.items() if now - v["created"] > _PENDING_TTL]:
-        _pending.pop(tok, None)
+    _pending.sweep()
 
 
 def _get(token: str, user_id: int) -> dict | None:
@@ -288,21 +289,11 @@ async def _send_card(bot, chat_id: int, album: AlbumInfo, caption: str, entities
 
 async def _edit_card(message: Message, album: AlbumInfo, caption: str, entities: list,
                      kb: InlineKeyboardMarkup) -> None:
-    if message.photo:
+    if not await safe_edit(message, caption, entities=entities, reply_markup=kb):
         try:
-            await message.edit_caption(caption=caption, caption_entities=entities, reply_markup=kb)
-            return
+            await message.edit_reply_markup(reply_markup=kb)
         except Exception:
             pass
-    try:
-        await message.edit_text(caption, entities=entities, reply_markup=kb)
-        return
-    except Exception:
-        pass
-    try:
-        await message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
 
 
 async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -> None:
@@ -315,7 +306,14 @@ async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -
         album_service.pretty_artist(album.artist, _ytdlp_proxy, _vk_fetcher),
         rzt_service.get_rating_for(album.artist, album.title),
         album_service.enrich_with_vk(album, _vk_fetcher),
+        return_exceptions=True,
     )
+    if isinstance(casing, BaseException):
+        casing = ""
+    if isinstance(rzt, BaseException):
+        rzt = None
+    if isinstance(feats_added, BaseException):
+        feats_added = 0
     data = _pending.get(token)
     if not data or data.get("user_id") != user_id:
         return
@@ -374,7 +372,7 @@ async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user
         pass
     sent = await _send_card(message.bot, message.chat.id, full, text, ents, kb)
     if sent is not None:
-        asyncio.create_task(_enrich_album(message.bot, sent, token, full, user_id))
+        spawn(_enrich_album(message.bot, sent, token, full, user_id), name="enrich_album")
 
 
 # ----------------------------- команда ---------------------------------------
@@ -511,28 +509,42 @@ async def cmd_album(message: Message):
 
 # ----------------------------- callbacks -------------------------------------
 
+def _cb_token(callback: CallbackQuery, prefix: str):
+    """Безопасно достаёт token из callback_data и данные сессии пользователя."""
+    args = parse_cb(callback.data, prefix, 1)
+    if args is None:
+        return None, None
+    return args[0], _get(args[0], callback.from_user.id)
+
+
 @router.callback_query(F.data.startswith("albumpick|"))
 async def cb_album_pick(callback: CallbackQuery):
-    try:
-        _, token, idx = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "albumpick|", 2)
+    if args is None:
         await callback.answer("Ошибка данных.", show_alert=True)
         return
+    token, idx = args
     data = _get(token, callback.from_user.id)
     if not data or "albums" not in data:
         await callback.answer("⌛ Устарело — поищите заново.", show_alert=True)
         return
+    i = to_int(idx)
+    if i is None or not (0 <= i < len(data["albums"])):
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     await callback.answer()
     await _present_album(
-        callback.message, data["albums"][int(idx)], data["channel_id"], data["user_id"],
+        callback.message, data["albums"][i], data["channel_id"], data["user_id"],
         alternatives=data["albums"],
     )
 
 
 @router.callback_query(F.data.startswith("album_sel|"))
 async def cb_album_sel(callback: CallbackQuery):
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_sel|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -543,16 +555,19 @@ async def cb_album_sel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("album_tg|"))
 async def cb_album_toggle(callback: CallbackQuery):
-    try:
-        _, token, idx = callback.data.split("|")
-    except ValueError:
+    args = parse_cb(callback.data, "album_tg|", 2)
+    if args is None:
         await callback.answer("Ошибка данных.", show_alert=True)
         return
+    token, idx = args
     data = _get(token, callback.from_user.id)
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    i = int(idx)
+    i = to_int(idx)
+    if i is None or not (0 <= i < len(data["album"].tracks)):
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     selected = data["selected"]
     if i in selected:
         selected.discard(i)
@@ -565,8 +580,10 @@ async def cb_album_toggle(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("album_all|"))
 async def cb_album_all(callback: CallbackQuery):
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_all|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -578,8 +595,10 @@ async def cb_album_all(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("album_none|"))
 async def cb_album_none(callback: CallbackQuery):
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_none|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -592,8 +611,10 @@ async def cb_album_none(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("album_mode|"))
 async def cb_album_mode(callback: CallbackQuery):
     """Переключает источник скачивания: uncensored ⇄ VK."""
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_mode|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -604,8 +625,10 @@ async def cb_album_mode(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("album_back|"))
 async def cb_album_back(callback: CallbackQuery):
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_back|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -617,8 +640,10 @@ async def cb_album_back(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("album_alt|"))
 async def cb_album_alt(callback: CallbackQuery):
     """«Не тот альбом» — вернуться к списку найденных вариантов."""
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_alt|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -640,10 +665,7 @@ async def cb_album_reenter(callback: CallbackQuery):
         "Напиши название — артист и альбом, например:\n"
         "<code>VILLIAN Красивое Зло</code>"
     )
-    try:
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML)
-    except Exception:
-        await callback.message.answer(text, parse_mode=ParseMode.HTML)
+    await edit_or_send(callback.message, text, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data.startswith("album_close|"))
@@ -655,7 +677,13 @@ async def cb_album_close(callback: CallbackQuery):
         pass
 
 
-async def _launch(callback: CallbackQuery, data: dict, tracks: list[Track], name: str) -> None:
+async def _launch(
+    callback: CallbackQuery,
+    data: dict,
+    tracks: list[Track],
+    name: str,
+    channel_header: bool = True,
+) -> None:
     if not tracks:
         await callback.answer("Ничего не выбрано.", show_alert=True)
         return
@@ -670,6 +698,7 @@ async def _launch(callback: CallbackQuery, data: dict, tracks: list[Track], name
         mode=mode,
         user_id=data["user_id"],
         cover_url=data["album"].cover_url,
+        channel_header=channel_header,
     )
 
 
@@ -690,8 +719,10 @@ def _album_tracks(album: AlbumInfo, indices=None) -> list[Track]:
 
 @router.callback_query(F.data.startswith("album_dl|"))
 async def cb_album_dl(callback: CallbackQuery):
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_dl|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
@@ -701,21 +732,29 @@ async def cb_album_dl(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("album_dlsel|"))
 async def cb_album_dlsel(callback: CallbackQuery):
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_dlsel|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
     album = data["album"]
     selected = data["selected"]
-    await _launch(callback, data, _album_tracks(album, selected), f"{album.artist} — {album.title}")
+    # Частичная загрузка — шапку/обложку альбома в канал НЕ отправляем.
+    await _launch(
+        callback, data, _album_tracks(album, selected),
+        f"{album.artist} — {album.title}", channel_header=False,
+    )
 
 
 @router.callback_query(F.data.startswith("album_src|"))
 async def cb_album_src(callback: CallbackQuery):
     """«Источник для каждого» — пикер источника/версии по каждому треку альбома."""
-    token = callback.data.split("|", 1)[1]
-    data = _get(token, callback.from_user.id)
+    token, data = _cb_token(callback, "album_src|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return

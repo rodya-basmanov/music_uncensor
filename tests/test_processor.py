@@ -128,3 +128,27 @@ def test_export_task_writes_files(tmp_path):
 def test_export_task_empty_returns_none(tmp_path):
     processor.set_exports_dir(str(tmp_path))
     assert processor.export_task("missing-task") is None
+
+
+def test_active_task_not_freed_on_cancel():
+    processor._tasks.clear()
+    processor._active_task.clear()
+    processor._active_users.clear()
+
+    tid = "t-cancel"
+    st = processor.TaskStatus(task_id=tid, user_id=4242, channel_id=-100)
+    processor._tasks[tid] = st
+    processor._active_task[4242] = tid
+    processor._active_users.add(4242)
+
+    assert processor.is_user_busy(4242)
+    assert processor.cancel_task(tid) is True
+    assert st.cancelled is True
+    # пользователь остаётся занят до finally задачи (иначе гонка с новой задачей)
+    assert processor.is_user_busy(4242)
+
+    # симулируем finally _process_tracks
+    if processor._active_task.get(4242) == tid:
+        processor._active_task.pop(4242, None)
+        processor._active_users.discard(4242)
+    assert not processor.is_user_busy(4242)

@@ -40,7 +40,8 @@ from utils.helpers import (
     generate_hash,
 )
 from utils.links import source_label
-from utils.logger import get_logger
+from utils.logger import bind_context, get_logger
+from utils.pending import PendingStore
 from utils.rich import edit_rich, send_rich
 from utils.ui import is_mashup, progress_bar
 
@@ -151,6 +152,45 @@ def _provider(name: str):
     return PROVIDERS.get(name)
 
 
+_search_locks: Dict[tuple, asyncio.Lock] = {}
+try:
+    _MAX_CONCURRENT_DOWNLOADS = max(1, int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "6") or 6))
+except (TypeError, ValueError):
+    _MAX_CONCURRENT_DOWNLOADS = 6
+_download_sem = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+
+
+async def _fetch_candidates(src: str, query: str, count: int, proxy: str) -> Optional[list]:
+    """Поиск в источнике с дедупликацией одновременных одинаковых запросов и кэшем.
+
+    Ошибки не кэшируются (иначе «не найдено» на 10 минут). None = ошибка.
+    """
+    cached = _cache_get(src, query)
+    if cached is not None:
+        return cached
+    key = _cache_key(src, query)
+    lock = _search_locks.get(key)
+    if lock is None:
+        # Не даём словарю ло́ков расти бесконечно: чистим неиспользуемые.
+        if len(_search_locks) > 256:
+            for k, lk in list(_search_locks.items()):
+                if not lk.locked():
+                    _search_locks.pop(k, None)
+        lock = asyncio.Lock()
+        _search_locks[key] = lock
+    async with lock:
+        cached = _cache_get(src, query)
+        if cached is not None:
+            return cached
+        try:
+            cands = await asyncio.to_thread(_provider(src), query, count, proxy)
+        except Exception as e:
+            log.warning("search_error", source=src, query=query, error=str(e))
+            return None
+        _cache_put(src, query, cands)
+        return cands
+
+
 @dataclass
 class TaskStatus:
     """Статус задачи обработки плейлиста."""
@@ -176,25 +216,25 @@ class TaskStatus:
     playlist_name: str | None = None
     total_duration: int = 0
     results: List[dict] = field(default_factory=list)
+    task: Optional[asyncio.Task] = None
 
 
 # Глобальное хранилище задач (в MVP — в памяти)
 _tasks: Dict[str, TaskStatus] = {}
 # Активные задачи по user_id (для ограничения 1 задача/юзер)
 _active_users: set = set()
+# user_id -> task_id текущей задачи (чтобы честно освобождать пользователя)
+_active_task: Dict[int, str] = {}
 
-# Кнопка «Не тот трек» под аудио в канале: token -> {query, channel_id, user_id, created}
-_redo_pending: Dict[str, dict] = {}
+# Кнопка «Не тот трек» под аудио в канале: token -> {query, channel_id, user_id}
+_redo_pending = PendingStore(ttl=3600)
 
 
 def register_redo(query: str, channel_id: int, user_id: int) -> str:
     """Регистрирует запрос для кнопки «Не тот трек» и возвращает токен."""
-    now = time.time()
-    for t in [t for t, v in _redo_pending.items() if now - v["created"] > 3600]:
-        _redo_pending.pop(t, None)
     token = uuid.uuid4().hex[:8]
     _redo_pending[token] = {
-        "query": query, "channel_id": channel_id, "user_id": user_id, "created": now,
+        "query": query, "channel_id": channel_id, "user_id": user_id,
     }
     return token
 
@@ -203,18 +243,14 @@ def get_redo(token: str) -> Optional[dict]:
     return _redo_pending.get(token)
 
 
-# «Докачать не найденные»: token -> {tracks, channel_id, user_id, mode, created}
-_retry_pending: Dict[str, dict] = {}
+# «Докачать не найденные»: token -> {tracks, channel_id, user_id, mode}
+_retry_pending = PendingStore(ttl=3600)
 
 
 def register_retry(tracks: List[Track], channel_id: int, user_id: int, mode: str) -> str:
-    now = time.time()
-    for t in [t for t, v in _retry_pending.items() if now - v["created"] > 3600]:
-        _retry_pending.pop(t, None)
     token = uuid.uuid4().hex[:8]
     _retry_pending[token] = {
-        "tracks": tracks, "channel_id": channel_id, "user_id": user_id,
-        "mode": mode, "created": now,
+        "tracks": tracks, "channel_id": channel_id, "user_id": user_id, "mode": mode,
     }
     return token
 
@@ -372,10 +408,36 @@ def export_task(task_id: str) -> Optional[dict]:
             f.write("\n".join(lines))
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(sent, f, ensure_ascii=False, indent=2)
+        _prune_exports()
     except Exception as e:
         log.warning("export_task_error", error=str(e))
         return None
     return {"txt": txt_path, "json": json_path, "count": len(sent), "name": name}
+
+
+_EXPORTS_KEEP = 50
+
+
+def _prune_exports(keep: int = _EXPORTS_KEEP) -> None:
+    """Оставляет последние ``keep`` экспортов, удаляя самые старые (.txt/.json)."""
+    if not _exports_dir or not os.path.isdir(_exports_dir):
+        return
+    try:
+        files = [
+            os.path.join(_exports_dir, f)
+            for f in os.listdir(_exports_dir)
+            if f.endswith((".txt", ".json"))
+        ]
+        if len(files) <= keep:
+            return
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for path in files[keep:]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _save_stats(force: bool = False) -> None:
@@ -430,7 +492,7 @@ def cleanup_old_tasks(max_age_minutes: int = 30) -> int:
 
 def is_user_busy(user_id: int) -> bool:
     """Проверяет, есть ли у пользователя активная задача."""
-    return user_id in _active_users
+    return user_id in _active_task
 
 
 def active_task_count() -> int:
@@ -439,15 +501,19 @@ def active_task_count() -> int:
 
 
 def cancel_user_task(user_id: int) -> str | None:
-    """Отменяет активную задачу пользователя. Returns task_id или None."""
-    if user_id not in _active_users:
+    """Отменяет активную задачу пользователя. Returns task_id или None.
+
+    Не освобождает пользователя здесь — это сделает finally задачи
+    (иначе возможна гонка с новой задачей того же юзера).
+    """
+    if user_id not in _active_task:
         return None
 
     for task_id, status in _tasks.items():
         if status.user_id == user_id and not status.done:
-            status.done = True
             status.cancelled = True
-            _active_users.discard(user_id)
+            if status.task is not None and not status.task.done():
+                status.task.cancel()
             log.info("task_cancelled", task_id=task_id, user_id=user_id)
             return task_id
     return None
@@ -458,9 +524,9 @@ def cancel_task(task_id: str) -> bool:
     status = _tasks.get(task_id)
     if not status or status.done:
         return False
-    status.done = True
     status.cancelled = True
-    _active_users.discard(status.user_id)
+    if status.task is not None and not status.task.done():
+        status.task.cancel()
     log.info("task_cancelled_by_id", task_id=task_id)
     return True
 
@@ -491,6 +557,7 @@ async def process_playlist(
     )
     _tasks[task_id] = status
     _active_users.add(user_id)
+    _active_task[user_id] = task_id
 
     task = asyncio.create_task(
         _process_tracks(
@@ -499,7 +566,16 @@ async def process_playlist(
             concurrency, cover_url, channel_header,
         )
     )
-    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    status.task = task
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.error("task_crashed", task_id=task_id, error=str(exc))
+
+    task.add_done_callback(_on_done)
 
     return task_id
 
@@ -676,6 +752,14 @@ async def _process_tracks(
     status.total_duration = total_duration
     status.mode = mode
 
+    # контекст в логи (task_id/user_id) + тег Sentry для трассировки
+    bind_context(task_id=status.task_id, user_id=status.user_id)
+    try:
+        import sentry_sdk
+        sentry_sdk.set_tag("task_id", status.task_id)
+    except Exception:
+        pass
+
     try:
         # Живое статус-сообщение (само обновляется)
         try:
@@ -765,8 +849,14 @@ async def _process_tracks(
                         await asyncio.sleep(random.uniform(rate_limit, rate_limit + 0.5))
 
             n = max(1, min(concurrency, len(tracks)))
-            workers = [asyncio.create_task(worker()) for _ in range(n)]
-            await asyncio.gather(*workers, return_exceptions=True)
+            workers = [asyncio.ensure_future(worker()) for _ in range(n)]
+            try:
+                await asyncio.gather(*workers, return_exceptions=True)
+            except asyncio.CancelledError:
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+                raise
 
         status.done = True
         status.current_track = ""
@@ -788,6 +878,16 @@ async def _process_tracks(
             except Exception as e:
                 log.error("report_send_error", error=str(e))
 
+    except asyncio.CancelledError:
+        status.done = True
+        status.cancelled = True
+        status.current_track = ""
+        try:
+            if status.status_message_id:
+                await _edit_status(bot, status, final=True, force=True)
+        except Exception:
+            pass
+        raise
     except Exception as e:
         log.error("playlist_processing_error", error=str(e), task_id=status.task_id)
         status.done = True
@@ -799,7 +899,10 @@ async def _process_tracks(
         except Exception:
             pass
     finally:
-        _active_users.discard(status.user_id)
+        # освобождаем пользователя только если его текущая задача — эта
+        if _active_task.get(status.user_id) == status.task_id:
+            _active_task.pop(status.user_id, None)
+            _active_users.discard(status.user_id)
         if len(_tasks) > 100:
             cleanup_old_tasks()
 
@@ -902,6 +1005,7 @@ async def _download_and_send(
     bitrate = 0
     download_s = 0.0
     cover_s = 0.0
+    cover_task: Optional[asyncio.Task] = None
     try:
         if cand.source == "vk":
             t_dl = time.time()
@@ -978,6 +1082,11 @@ async def _download_and_send(
             cover_s = time.time() - t_cov
             log.info("cover_resolved", track=disp_title[:40], origin=cover_origin)
     finally:
+        # Отменяем «осиротевшую» задачу обложки (напр. при отмене или ошибке до её await).
+        if cover_task is not None and not cover_task.done():
+            cover_task.cancel()
+        if cover_task is not None:
+            await asyncio.gather(cover_task, return_exceptions=True)
         shutil.rmtree(work_dir, ignore_errors=True)
 
     if display_override:
@@ -1002,7 +1111,7 @@ async def _download_and_send(
         download_s=round(download_s, 1), cover_s=round(cover_s, 1), send_s=round(send_s, 1),
     )
 
-    cache_mgr.save(hash_key, {
+    await asyncio.to_thread(cache_mgr.save, hash_key, {
         "artist": original_artist or query,
         "title": original_title or query,
         "display_artist": disp_artist,
@@ -1033,14 +1142,9 @@ async def search_all(
         searcher = _provider(src)
         if not searcher:
             return []
-        cands = _cache_get(src, query)
+        cands = await _fetch_candidates(src, query, per_source, ytdlp_proxy)
         if cands is None:
-            try:
-                cands = await asyncio.to_thread(searcher, query, per_source, ytdlp_proxy)
-            except Exception as e:
-                log.warning("search_error", source=src, query=query, error=str(e))
-                cands = []
-            _cache_put(src, query, cands)
+            return []
         return rank_candidates(cands, query, 0, "", limit=per_source)
 
     groups = await asyncio.gather(*(one(s) for s in source_order))
@@ -1153,7 +1257,7 @@ async def _download_vk_and_send(
         channel_id, final_mp3, send_track,
         cover=cover_path or None, reply_markup=redo_kb, caption=_build_caption(track.url),
     )
-    cache_mgr.save(hash_key, {
+    await asyncio.to_thread(cache_mgr.save, hash_key, {
         "artist": track.artist,
         "title": track.title,
         "display_artist": disp_artist,
@@ -1186,51 +1290,63 @@ async def _process_single_track(
     hash_key = generate_hash(track.artist or track.query or "", track.title)
     vk_available = track.source == "vk" and bool(track.url)
     _bump(total_tracks=1)
+    bind_context(track=track.title[:40])
 
     if cancel is not None and cancel():
         return "cancelled"
 
     # --- кэш ---
-    cached = cache_mgr.get(hash_key)
+    cached = await asyncio.to_thread(cache_mgr.get, hash_key)
     if cached:
-        file_id = cached.get("telegram_file_id")
-        file_path = cached.get("file_path", "")
-        cover = cached.get("cover_path") or ""
-        disp_artist = cached.get("display_artist") or track.artist
-        disp_title = cached.get("display_title") or track.title
-        if track.force_meta:
-            disp_artist = track.artist or disp_artist
-            disp_title = track.title or disp_title
-        send_track = Track(
-            artist=disp_artist,
-            title=disp_title,
-            duration=int(track.duration or cached.get("duration") or 0),
-        )
-        redo_query = (
-            track.query
-            or f"{track.artist} {track.title}".strip()
-            or f"{disp_artist} {disp_title}".strip()
-        )
-        redo_kb = _redo_keyboard(redo_query, channel_id, user_id)
-        caption = _build_caption(cached.get("source_url", ""))
-        if file_id:
-            try:
-                res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover, reply_markup=redo_kb, caption=caption)
-                if res.get("cover_file_id") and not cached.get("cover_file_id"):
-                    cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
-                cache_mgr.update_access(hash_key)
+        try:
+            file_id = cached.get("telegram_file_id")
+            file_path = cached.get("file_path", "")
+            cover = cached.get("cover_path") or ""
+            disp_artist = cached.get("display_artist") or track.artist
+            disp_title = cached.get("display_title") or track.title
+            if track.force_meta:
+                disp_artist = track.artist or disp_artist
+                disp_title = track.title or disp_title
+            send_track = Track(
+                artist=disp_artist,
+                title=disp_title,
+                duration=int(track.duration or cached.get("duration") or 0),
+            )
+            redo_query = (
+                track.query
+                or f"{track.artist} {track.title}".strip()
+                or f"{disp_artist} {disp_title}".strip()
+            )
+            redo_kb = _redo_keyboard(redo_query, channel_id, user_id)
+            caption = _build_caption(cached.get("source_url", ""))
+            if file_id:
+                sent = False
+                try:
+                    res = await sender.send_by_file_id(channel_id, file_id, send_track, cover=cover, reply_markup=redo_kb, caption=caption)
+                    sent = True
+                except Exception as e:
+                    log.warning("file_id_send_failed", title=track.title[:40], error=str(e))
+                if sent:
+                    # Обновление кэша — отдельно: его сбой НЕ должен приводить
+                    # к повторной отправке (сообщение уже ушло в канал).
+                    try:
+                        if res.get("cover_file_id") and not cached.get("cover_file_id"):
+                            await asyncio.to_thread(cache_mgr.save_cover_file_id, hash_key, res["cover_file_id"])
+                        await asyncio.to_thread(cache_mgr.update_access, hash_key)
+                    except Exception as e:
+                        log.warning("cache_update_failed", title=track.title[:40], error=str(e))
+                    _bump(total_sent=1, total_cached=1)
+                    return "sent_cached_file_id"
+            if file_path and os.path.exists(file_path):
+                res = await sender.send_file(channel_id, file_path, send_track, cover=cover, reply_markup=redo_kb, caption=caption)
+                if res.get("file_id"):
+                    await asyncio.to_thread(cache_mgr.save_file_id, hash_key, res["file_id"])
+                if res.get("cover_file_id"):
+                    await asyncio.to_thread(cache_mgr.save_cover_file_id, hash_key, res["cover_file_id"])
                 _bump(total_sent=1, total_cached=1)
-                return "sent_cached_file_id"
-            except Exception:
-                pass
-        if file_path and os.path.exists(file_path):
-            res = await sender.send_file(channel_id, file_path, send_track, cover=cover, reply_markup=redo_kb, caption=caption)
-            if res.get("file_id"):
-                cache_mgr.save_file_id(hash_key, res["file_id"])
-            if res.get("cover_file_id"):
-                cache_mgr.save_cover_file_id(hash_key, res["cover_file_id"])
-            _bump(total_sent=1, total_cached=1)
-            return "sent_cached_file"
+                return "sent_cached_file"
+        except Exception as e:
+            log.warning("cache_send_failed", title=track.title[:40], error=str(e))
 
     # --- VK: режим «Всё из VK» ---
     if mode == "vk":
@@ -1238,10 +1354,11 @@ async def _process_single_track(
         if vk_track is None:
             vk_track = await asyncio.to_thread(_vk_find_track, track)
         if vk_track and vk_track.url:
-            info = await _download_vk_and_send(
-                vk_track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
-                (track.artist, track.title) if track.force_meta else None, cancel=cancel,
-            )
+            async with _download_sem:
+                info = await _download_vk_and_send(
+                    vk_track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
+                    (track.artist, track.title) if track.force_meta else None, cancel=cancel,
+                )
             if info:
                 log.info("track_sent", source="vk", display=f"{info['artist']} - {info['title']}")
                 return "sent_new"
@@ -1261,16 +1378,8 @@ async def _process_single_track(
     sources = [s for s in order if _provider(s)]
 
     async def _search_src(src: str) -> list:
-        cached = _cache_get(src, query)
-        if cached is not None:
-            return cached
-        try:
-            cands = await asyncio.to_thread(_provider(src), query, 5, ytdlp_proxy)
-        except Exception as e:
-            log.warning("search_error", source=src, query=query, error=str(e))
-            cands = []
-        _cache_put(src, query, cands)
-        return cands
+        result = await _fetch_candidates(src, query, 5, ytdlp_proxy)
+        return result if result is not None else []
 
     try:
         # ищем во всех источниках параллельно, а качаем по приоритету
@@ -1293,13 +1402,14 @@ async def _process_single_track(
                 continue
 
             for cand in ranked:
-                info = await _download_and_send(
-                    cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key,
-                    artist_hint, track.duration, track.artist, track.title, query,
-                    track.cover_url, user_id,
-                    (track.artist, track.title) if track.force_meta else None,
-                    cancel=cancel,
-                )
+                async with _download_sem:
+                    info = await _download_and_send(
+                        cand, channel_id, cache_mgr, sender, ytdlp_proxy, hash_key,
+                        artist_hint, track.duration, track.artist, track.title, query,
+                        track.cover_url, user_id,
+                        (track.artist, track.title) if track.force_meta else None,
+                        cancel=cancel,
+                    )
                 if info:
                     log.info("track_sent", source=info["source"], display=f"{info['artist']} - {info['title']}")
                     log.info("track_timing", title=track.title[:30], search_s=round(search_s, 1))
@@ -1309,10 +1419,11 @@ async def _process_single_track(
 
         # Fallback: ничего не нашли в uncensored-источниках → отдаём версию из VK
         if mode != "vk" and vk_available and not (cancel is not None and cancel()):
-            info = await _download_vk_and_send(
-                track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
-                (track.artist, track.title) if track.force_meta else None, cancel=cancel,
-            )
+            async with _download_sem:
+                info = await _download_vk_and_send(
+                    track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,
+                    (track.artist, track.title) if track.force_meta else None, cancel=cancel,
+                )
             if info:
                 log.info("track_sent_vk_fallback", display=f"{info['artist']} - {info['title']}")
                 return "sent_new"

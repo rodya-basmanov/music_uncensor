@@ -137,7 +137,11 @@ async def enrich_with_vk(album: AlbumInfo, vk_fetcher) -> int:
         return 0
 
     deezer_norms = {_norm_title(t.title) for t in album.tracks if t.title}
-    threshold = max(3, len(album.tracks) // 3)
+    if not deezer_norms:
+        return 0
+    # Порог подтверждения: ~third треклиста (для коротких альбомов — послабже,
+    # иначе даже верный VK-альбом из 3-6 треков не проходит).
+    need = max(1, len(deezer_norms) // 3)
 
     def window_overlap(g: dict) -> int:
         return len({_norm_title(t["title"]) for t in g["tracks"]} & deezer_norms)
@@ -145,6 +149,8 @@ async def enrich_with_vk(album: AlbumInfo, vk_fetcher) -> int:
     ordered = sorted(groups, key=lambda g: (window_overlap(g), len(g["tracks"])), reverse=True)
 
     vk_tracks: list[Track] = []
+    best_tracks: list[Track] = []
+    best_overlap = -1
     for g in ordered[:3]:
         try:
             cand = await asyncio.to_thread(
@@ -155,10 +161,15 @@ async def enrich_with_vk(album: AlbumInfo, vk_fetcher) -> int:
             continue
         if not cand:
             continue
-        # подтверждаем совпадение по полному треклисту
-        if len({_norm_title(v.title) for v in cand} & deezer_norms) >= threshold:
-            vk_tracks = cand
+        # подтверждаем совпадение по полному треклисту, запоминая лучшего кандидата
+        ov = len({_norm_title(v.title) for v in cand} & deezer_norms)
+        if ov > best_overlap:
+            best_overlap = ov
+            best_tracks = cand
+        if ov >= len(deezer_norms):
             break
+    if best_tracks and best_overlap >= need:
+        vk_tracks = best_tracks
     if not vk_tracks:
         return 0
 
