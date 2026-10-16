@@ -7,6 +7,8 @@ from services.album import (
     _query_variants,
     _rank_albums,
     parse_deezer_album,
+    parse_deezer_artist,
+    parse_deezer_artist_albums,
     parse_deezer_search,
 )
 from utils.helpers import Track
@@ -65,6 +67,63 @@ def test_parse_deezer_album():
 def test_parse_deezer_album_error():
     assert parse_deezer_album({"error": {"message": "not found"}}) is None
     assert parse_deezer_album(None) is None
+
+
+def test_parse_deezer_artist_skips_invalid():
+    data = {"data": [
+        {"id": 5, "name": "SALUKI"},
+        {"id": None, "name": "nope"},
+        {"id": 7, "name": ""},
+    ]}
+    assert parse_deezer_artist(data) == [{"id": "5", "name": "SALUKI", "fans": 0}]
+    assert parse_deezer_artist(None) == []
+
+
+def test_parse_deezer_artist_albums():
+    data = {"data": [
+        {"id": 1, "title": "EUPHORIA", "release_date": "2025-04-11",
+         "artist": {"name": "SALUKI"}, "cover_xl": "https://cdn/xl"},
+        {"id": None, "title": "skip"},
+    ]}
+    albums = parse_deezer_artist_albums(data)
+    assert len(albums) == 1
+    a = albums[0]
+    assert a.title == "EUPHORIA"
+    assert a.year == "2025"
+    assert a.release_date == "2025-04-11"
+    assert a.cover_url == "https://cdn/xl"
+    assert a.source == "deezer"
+    assert a.tracks == []
+    # имя артиста подставляется, если Deezer его не вернул
+    al2 = parse_deezer_artist_albums({"data": [{"id": 2, "title": "X"}]}, "SALUKI")
+    assert al2[0].artist == "SALUKI"
+
+
+def test_search_artist_prefers_popular(monkeypatch):
+    import asyncio
+
+    import services.album as album_mod
+
+    async def fake_fetch(url, proxy=""):
+        return {"data": [
+            {"id": 1, "name": "SALUKI", "nb_fan": 11},
+            {"id": 2, "name": "SALUKI", "nb_fan": 15813},
+        ]}
+
+    monkeypatch.setattr(album_mod, "_fetch", fake_fetch)
+    assert asyncio.run(album_mod.search_artist("saluki")) == {"id": "2", "name": "SALUKI"}
+
+
+def test_search_artist_rejects_weak_match(monkeypatch):
+    import asyncio
+
+    import services.album as album_mod
+
+    async def fake_fetch(url, proxy=""):
+        return {"data": [{"id": 9, "name": "Some Other Band", "nb_fan": 99999}]}
+
+    monkeypatch.setattr(album_mod, "_fetch", fake_fetch)
+    assert asyncio.run(album_mod.search_artist("saluki")) is None
 
 
 def test_parse_itunes_search_removed():
@@ -191,3 +250,32 @@ def test_split_artists():
     assert _split_artists("SALUKI, Sabu") == ("SALUKI", ["Sabu"])
     assert _split_artists("SALUKI") == ("SALUKI", [])
     assert _split_artists("SALUKI feat. Joviee") == ("SALUKI", ["Joviee"])
+
+
+def test_album_serialization_roundtrip():
+    from services.album import _album_from_dict, _album_to_dict
+
+    a = AlbumInfo(
+        source="deezer", id="1", artist="SALUKI", title="EUPHORIA", year="2025",
+        release_date="2025-04-11",
+        tracks=[Track(artist="SALUKI", title="weekend", duration=200, feat=["Sabu"])],
+    )
+    back = _album_from_dict(_album_to_dict(a))
+    assert back.title == "EUPHORIA"
+    assert back.release_date == "2025-04-11"
+    assert back.tracks[0].title == "weekend"
+    assert back.tracks[0].feat == ["Sabu"]
+
+
+def test_maybe_artist_albums_guards():
+    import asyncio
+
+    from bot.handlers import playlist
+
+    class _Msg:
+        class from_user:
+            id = 1
+
+    # длинный запрос и короткий — не трогаем сеть, сразу False
+    assert asyncio.run(playlist._maybe_artist_albums(_Msg(), "one two three", -100)) is False
+    assert asyncio.run(playlist._maybe_artist_albums(_Msg(), "ab", -100)) is False

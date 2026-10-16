@@ -32,6 +32,7 @@ router = Router()
 _storage: UserStorage | None = None
 _ytdlp_proxy: str = ""
 _vk_fetcher = None
+_db = None
 
 _pending = PendingStore(ttl=20 * 60)
 
@@ -79,9 +80,10 @@ def _fallback_queries(query: str) -> list[str]:
 
 def set_dependencies(storage: UserStorage, ytdlp_proxy: str = "", vk_token: str = "") -> None:
     """Прокидывает зависимости из main."""
-    global _storage, _ytdlp_proxy, _vk_fetcher
+    global _storage, _ytdlp_proxy, _vk_fetcher, _db
     _storage = storage
     _ytdlp_proxy = ytdlp_proxy
+    _db = getattr(storage, "db", None)
     if vk_token:
         from core.vk_fetcher import VKFetcher
         _vk_fetcher = VKFetcher(vk_token)
@@ -217,7 +219,7 @@ def _mode_label(mode: str) -> str:
 
 
 def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored",
-                   can_alt: bool = False) -> InlineKeyboardMarkup:
+                   can_alt: bool = False, fav: bool = False) -> InlineKeyboardMarkup:
     n = len(album.tracks)
     rows = [
         [InlineKeyboardButton(
@@ -230,8 +232,21 @@ def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored",
     ]
     if can_alt:
         rows.append([InlineKeyboardButton(text="🔁 Не тот альбом", callback_data=f"album_alt|{token}")])
+    rows.append([InlineKeyboardButton(
+        text="★ Убрать из избранного" if fav else "⭐ В избранное",
+        callback_data=f"album_fav|{token}",
+    )])
     rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data=f"album_close|{token}", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _is_fav(data: dict, album: AlbumInfo) -> bool:
+    if _db is None:
+        return False
+    try:
+        return _db.is_favorite(data["user_id"], album.artist, album.title)
+    except Exception:
+        return False
 
 
 def _select_keyboard(token: str, album: AlbumInfo, selected: set, mode: str = "uncensored") -> InlineKeyboardMarkup:
@@ -269,7 +284,8 @@ async def _render_album_view(message: Message, token: str, data: dict) -> None:
     else:
         text, ents = _album_caption(album, rzt=rzt)
         can_alt = len(data.get("alternatives") or []) > 1
-        await _edit_card(message, album, text, ents, _card_keyboard(token, album, mode, can_alt))
+        await _edit_card(message, album, text, ents,
+                         _card_keyboard(token, album, mode, can_alt, _is_fav(data, album)))
 
 
 async def _send_card(bot, chat_id: int, album: AlbumInfo, caption: str, entities: list, kb: InlineKeyboardMarkup):
@@ -336,7 +352,7 @@ async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -
             can_alt = len(data.get("alternatives") or []) > 1
             await _edit_card(
                 sent, album, text, ents,
-                _card_keyboard(token, album, data.get("mode", "uncensored"), can_alt),
+                _card_keyboard(token, album, data.get("mode", "uncensored"), can_alt, _is_fav(data, album)),
             )
     except Exception:
         pass
@@ -365,7 +381,7 @@ async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user
         "created": time.time(),
     }
     text, ents = _album_caption(full)
-    kb = _card_keyboard(token, full, "uncensored", len(alts) > 1)
+    kb = _card_keyboard(token, full, "uncensored", len(alts) > 1, _is_fav(_pending[token], full))
     try:
         await message.delete()
     except Exception:
@@ -403,36 +419,111 @@ async def handle_album_text(message: Message):
     await _start_album_search(message, text)
 
 
-async def _show_album_picker(message: Message, albums: list, channel_id: int, user_id: int, fuzzy: bool = False) -> None:
-    albums = albums[:5]
-    # пока список открыт — следующее сообщение снова ищем как альбом
-    _awaiting[user_id] = time.time() + _AWAIT_TTL
-    token = uuid.uuid4().hex[:8]
-    _pending[token] = {
-        "user_id": user_id, "channel_id": channel_id,
-        "albums": albums, "created": time.time(),
-    }
+_PICKER_PAGE = 8
+
+
+def _picker_view(token: str, data: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и клавиатура пикера альбомов с пагинацией."""
+    albums = data["albums"]
+    total_pages = max(1, (len(albums) + _PICKER_PAGE - 1) // _PICKER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PICKER_PAGE
+    chunk = albums[start:start + _PICKER_PAGE]
     rows = []
-    for i, a in enumerate(albums):
+    for j, a in enumerate(chunk):
+        i = start + j
         label = f"{a.artist} — {a.title}"
         if a.year:
             label += f" ({a.year})"
         if len(label) > 60:
             label = label[:59] + "…"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"albumpick|{token}|{i}")])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"albumpage|{token}|{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"· {page + 1}/{total_pages} ·", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"albumpage|{token}|{page + 1}"))
+        rows.append(nav)
+    if data.get("track_query"):
+        rows.append([InlineKeyboardButton(
+            text=f"🔎 Искать как трек: {data['track_query'][:24]}",
+            callback_data=f"tracksearch|{token}",
+        )])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="album_reenter", style="danger")])
-    if fuzzy:
-        header = "💿 <b>Возможно, ты имел в виду — выбери альбом 👇</b>"
+    if data.get("header"):
+        text = data["header"]
+    elif data.get("fuzzy"):
+        text = "💿 <b>Возможно, ты имел в виду — выбери альбом 👇</b>"
     else:
-        header = "💿 <b>Нашёл альбомы:</b>\nВыбери нужный 👇"
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        text = "💿 <b>Нашёл альбомы:</b>\nВыбери нужный 👇"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_picker_msg(message: Message, token: str, data: dict, page: int) -> None:
+    text, kb = _picker_view(token, data, page)
     try:
-        if message.photo:
-            await message.edit_caption(caption=header, parse_mode=ParseMode.HTML, reply_markup=kb)
+        if getattr(message, "photo", None):
+            await message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         else:
-            await message.edit_text(header, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception:
-        await message.answer(header, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _show_album_picker(message: Message, albums: list, channel_id: int, user_id: int,
+                             fuzzy: bool = False, header: str | None = None,
+                             track_query: str | None = None, set_awaiting: bool = True) -> None:
+    if not albums:
+        return
+    # пока список открыт — следующее сообщение снова ищем как альбом
+    if set_awaiting:
+        _awaiting[user_id] = time.time() + _AWAIT_TTL
+    token = uuid.uuid4().hex[:8]
+    _pending[token] = {
+        "user_id": user_id, "channel_id": channel_id,
+        "albums": albums, "created": time.time(), "page": 0,
+        "fuzzy": fuzzy, "header": header, "track_query": track_query,
+    }
+    await _render_picker_msg(message, token, _pending[token], 0)
+
+
+async def show_artist_albums(message: Message, query: str, channel_id: int, user_id: int,
+                             track_fallback: str | None = None) -> bool:
+    """Для обычного трек-поиска: если запрос — имя артиста, показать его альбомы.
+
+    Возвращает True, если альбомы найдены и пикер показан.
+    """
+    try:
+        artist = await album_service.search_artist(query, _ytdlp_proxy)
+        albums = await album_service.search_artist_albums(query, _ytdlp_proxy) if artist else []
+    except Exception:
+        return False
+    if not artist or not albums:
+        return False
+    header = f"💿 <b>{esc_html(artist['name'])}</b> — выбери альбом 👇"
+    status = await message.answer("💿 Ищу альбомы артиста…", parse_mode=ParseMode.HTML)
+    await _show_album_picker(
+        status, albums, channel_id, user_id,
+        header=header, track_query=track_fallback, set_awaiting=False,
+    )
+    return True
+
+
+async def open_album(message: Message, query: str, channel_id: int, user_id: int) -> bool:
+    """Открывает альбом по строке «Артист Название» (для /history и /favorites)."""
+    try:
+        albums = await album_service.search_albums(query, _ytdlp_proxy)
+    except Exception:
+        albums = []
+    if not albums:
+        return False
+    if len(albums) == 1 or album_service._album_score(query, albums[0]) >= _AUTO_PICK_SCORE:
+        await _present_album(message, albums[0], channel_id, user_id, albums)
+    else:
+        await _show_album_picker(message, albums, channel_id, user_id)
+    return True
 
 
 async def _start_album_search(message: Message, query: str) -> None:
@@ -456,6 +547,25 @@ async def _start_album_search(message: Message, query: str) -> None:
     status = await message.answer(
         f"💿 Ищу альбом: <i>{esc_html(query)}</i>...", parse_mode=ParseMode.HTML,
     )
+
+    # Режим артиста: «saluki» → все альбомы артиста (без авто-выбора).
+    try:
+        artist = await album_service.search_artist(query, _ytdlp_proxy)
+    except Exception:
+        artist = None
+    if artist:
+        try:
+            artist_albums = await album_service.search_artist_albums(query, _ytdlp_proxy)
+        except Exception:
+            artist_albums = []
+        if artist_albums:
+            _cleanup()
+            await _show_album_picker(
+                status, artist_albums, channel_id, user_id,
+                header=f"💿 <b>{esc_html(artist['name'])}</b> — выбери альбом 👇",
+            )
+            return
+
     try:
         albums = await album_service.search_albums(query, _ytdlp_proxy)
     except Exception as e:
@@ -537,6 +647,63 @@ async def cb_album_pick(callback: CallbackQuery):
         callback.message, data["albums"][i], data["channel_id"], data["user_id"],
         alternatives=data["albums"],
     )
+
+
+@router.callback_query(F.data.startswith("albumpage|"))
+async def cb_album_page(callback: CallbackQuery):
+    """Листание страниц списка альбомов артиста."""
+    args = parse_cb(callback.data, "albumpage|", 2)
+    if args is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    token, page = args
+    data = _get(token, callback.from_user.id)
+    if not data or "albums" not in data:
+        await callback.answer("⌛ Устарело.", show_alert=True)
+        return
+    p = to_int(page)
+    if p is None:
+        await callback.answer()
+        return
+    data["page"] = p
+    await callback.answer()
+    await _render_picker_msg(callback.message, token, data, p)
+
+
+@router.callback_query(F.data.startswith("tracksearch|"))
+async def cb_track_search(callback: CallbackQuery):
+    """Из пикера артиста — искать всё-таки трек."""
+    token, data = _cb_token(callback, "tracksearch|")
+    if token is None:
+        await callback.answer("Ошибка данных.", show_alert=True)
+        return
+    q = data.get("track_query") if data else None
+    if not q:
+        await callback.answer("⌛ Устарело.", show_alert=True)
+        return
+    await callback.answer("🔎 Ищу трек…")
+    await playlist._show_picker(callback.message, q, data["channel_id"], user_id=callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("album_fav|"))
+async def cb_album_fav(callback: CallbackQuery):
+    """Добавить/убрать альбом из избранного."""
+    token, data = _cb_token(callback, "album_fav|")
+    if token is None or not data or "album" not in data:
+        await callback.answer("⌛ Устарело.", show_alert=True)
+        return
+    album = data["album"]
+    uid = data["user_id"]
+    if _db is None or callback.from_user.id != uid:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    if _db.is_favorite(uid, album.artist, album.title):
+        _db.remove_favorite(uid, album.artist, album.title)
+        await callback.answer("Убрано из избранного")
+    else:
+        _db.add_favorite(uid, album.artist, album.title)
+        await callback.answer("⭐ Добавлено в избранное")
+    await _render_album_view(callback.message, token, data)
 
 
 @router.callback_query(F.data.startswith("album_sel|"))

@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import dataclasses
 import re
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,38 @@ _UA = (
 _CACHE_TTL = 600
 _search_cache: dict[str, tuple[float, list]] = {}
 _album_cache: dict[tuple[str, str], tuple[float, "AlbumInfo"]] = {}
+
+_db = None  # utils.db.Database — персистентный кэш поиска (переживает рестарт)
+
+
+def set_db(db) -> None:
+    """Подключает SQLite для персистентного кэша поиска альбомов/артистов."""
+    global _db
+    _db = db
+
+
+def _album_to_dict(a: "AlbumInfo") -> dict:
+    return dataclasses.asdict(a)
+
+
+def _album_from_dict(d: dict) -> "AlbumInfo":
+    data = dict(d)
+    tracks = [Track(**t) for t in data.pop("tracks", []) or []]
+    return AlbumInfo(tracks=tracks, **data)
+
+
+def _albums_to_dicts(albums: list) -> list:
+    return [_album_to_dict(a) for a in albums]
+
+
+def _albums_from_dicts(items: list) -> list:
+    out = []
+    for d in items or []:
+        try:
+            out.append(_album_from_dict(d))
+        except Exception:
+            continue
+    return out
 
 
 @dataclass
@@ -312,6 +345,112 @@ def parse_deezer_album(data: Any) -> Optional[AlbumInfo]:
     )
 
 
+def parse_deezer_artist(data: Any) -> list[dict]:
+    """Разбирает ответ /search/artist в [{id, name, fans}]."""
+    out: list[dict] = []
+    for r in (data or {}).get("data", []) or []:
+        name = (r.get("name") or "").strip()
+        if r.get("id") and name:
+            out.append({"id": str(r["id"]), "name": name, "fans": int(r.get("nb_fan") or 0)})
+    return out
+
+
+def parse_deezer_artist_albums(data: Any, artist_name: str = "") -> list[AlbumInfo]:
+    """Разбирает ответ /artist/{id}/albums в список AlbumInfo (без треков).
+
+    В ответе Deezer у релизов нет поля ``artist`` — подставляем имя искомого артиста.
+    """
+    out: list[AlbumInfo] = []
+    for r in (data or {}).get("data", []) or []:
+        if not r.get("id"):
+            continue
+        out.append(AlbumInfo(
+            source="deezer",
+            id=str(r.get("id")),
+            artist=(r.get("artist") or {}).get("name") or artist_name,
+            title=(r.get("title") or "").strip(),
+            year=(r.get("release_date") or "")[:4],
+            release_date=r.get("release_date", "") or "",
+            cover_url=r.get("cover_xl") or r.get("cover_big") or r.get("cover_medium") or "",
+        ))
+    return out
+
+
+async def search_artist(name: str, proxy: str = "") -> Optional[dict]:
+    """Ищет артиста в Deezer. Возвращает {'id','name'} при уверенном совпадении.
+
+    У Deezer бывает несколько артистов с одинаковым именем — среди совпавших
+    по имени выбираем самого популярного (``nb_fan``).
+    """
+    q = (name or "").strip()
+    if not q:
+        return None
+    target = _norm_title(q)
+    if not target:
+        return None
+    url = "https://api.deezer.com/search/artist?q=" + quote_plus(q) + "&limit=10"
+    data = None
+    for attempt in range(2):  # первый запрос бывает «холодным» — не сдаёмся сразу
+        try:
+            data = await asyncio.wait_for(_fetch(url, proxy), timeout=8)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            break
+        if attempt == 0:
+            await asyncio.sleep(0.4)
+    if not isinstance(data, dict):
+        return None
+    cands = parse_deezer_artist(data)
+    exact = [a for a in cands if _norm_title(a["name"]) == target]
+    if exact:
+        pool = exact
+    else:
+        pool = [a for a in cands if fuzz.token_set_ratio(target, _norm_title(a["name"])) >= 92]
+    if not pool:
+        return None
+    best = max(pool, key=lambda a: a.get("fans", 0))
+    return {"id": best["id"], "name": best["name"]}
+
+
+async def search_artist_albums(name: str, proxy: str = "", limit: int = 50) -> list[AlbumInfo]:
+    """Все альбомы артиста (Deezer), свежие сверху. Пусто, если артист не найден."""
+    key = "artist:" + (name or "").strip().lower()
+    cached = _search_cache.get(key)
+    if cached and time.time() - cached[0] < _CACHE_TTL:
+        return cached[1]
+    if _db is not None:
+        try:
+            stored = _db.cache_get(key)
+            if stored is not None and stored:
+                albums = _albums_from_dicts(stored)
+                if albums:
+                    _search_cache[key] = (time.time(), albums)
+                    return albums
+        except Exception:
+            pass
+    artist = await search_artist(name, proxy)
+    if not artist:
+        # не кэшируем «пусто»: иначе разовый сетевой сбой выключит фичу на 10 минут
+        return []
+    n = max(1, min(int(limit), 100))
+    url = f"https://api.deezer.com/artist/{artist['id']}/albums?limit={n}"
+    try:
+        data = await asyncio.wait_for(_fetch(url, proxy), timeout=8)
+    except Exception:
+        data = None
+    albums = parse_deezer_artist_albums(data, artist["name"]) if isinstance(data, dict) else []
+    albums.sort(key=lambda a: (a.release_date or a.year or ""), reverse=True)
+    _search_cache[key] = (time.time(), albums)
+    if albums and _db is not None:
+        try:
+            _db.cache_set(key, _albums_to_dicts(albums), _CACHE_TTL)
+        except Exception:
+            pass
+    log.info("artist_albums_done", artist=artist["name"], count=len(albums))
+    return albums
+
+
 # ----------------------------- регистр артиста --------------------------------
 
 def _pick_casing(name: str, candidates: list[str]) -> str:
@@ -394,6 +533,15 @@ async def search_albums(query: str, proxy: str = "", limit: int = 5) -> list[Alb
     cached = _search_cache.get(key)
     if cached and time.time() - cached[0] < _CACHE_TTL:
         return cached[1]
+    if _db is not None:
+        try:
+            stored = _db.cache_get("alb:" + key)
+            if stored is not None:
+                albums = _albums_from_dicts(stored)
+                _search_cache[key] = (time.time(), albums)
+                return albums
+        except Exception:
+            pass
 
     per = max(limit, 10)
     urls = [
@@ -429,6 +577,11 @@ async def search_albums(query: str, proxy: str = "", limit: int = 5) -> list[Alb
 
     albums = _rank_albums(query, pool)[:limit] if pool else []
     _search_cache[key] = (time.time(), albums)
+    if albums and _db is not None:
+        try:
+            _db.cache_set("alb:" + key, _albums_to_dicts(albums), _CACHE_TTL)
+        except Exception:
+            pass
     log.info("album_search_done", query=query[:40], count=len(albums))
     return albums
 
@@ -439,6 +592,16 @@ async def get_album(source: str, album_id: str, proxy: str = "") -> Optional[Alb
     cached = _album_cache.get(ck)
     if cached and time.time() - cached[0] < _CACHE_TTL:
         return cached[1]
+    db_key = f"ali:{source}:{album_id}"
+    if _db is not None:
+        try:
+            stored = _db.cache_get(db_key)
+            if stored:
+                cached_album = _album_from_dict(stored)
+                _album_cache[ck] = (time.time(), cached_album)
+                return cached_album
+        except Exception:
+            pass
 
     album: Optional[AlbumInfo] = None
     if source == "deezer":
@@ -446,4 +609,9 @@ async def get_album(source: str, album_id: str, proxy: str = "") -> Optional[Alb
 
     if album is not None:
         _album_cache[ck] = (time.time(), album)
+        if _db is not None:
+            try:
+                _db.cache_set(db_key, _album_to_dict(album), _CACHE_TTL)
+            except Exception:
+                pass
     return album

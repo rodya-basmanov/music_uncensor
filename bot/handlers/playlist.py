@@ -701,6 +701,25 @@ async def handle_playlist_file(message: Message):
     await _start_processing(message, raw_text=content, playlist_name_override=playlist_name)
 
 
+async def _maybe_artist_albums(message: Message, query: str, channel_id: int) -> bool:
+    """Если запрос похож на имя артиста — предлагаем его альбомы (с фолбэком на трек).
+
+    Срабатывает только для коротких (1-2 слова) одиночных запросов.
+    """
+    q = (query or "").strip()
+    words = [w for w in re.split(r"\s+", q) if w]
+    if not (1 <= len(words) <= 2) or len(q) < 3 or is_mashup(q):
+        return False
+    from bot.handlers import album as album_handler  # ленивый импорт: избегаем цикла
+    try:
+        return await album_handler.show_artist_albums(
+            message, q, channel_id, message.from_user.id, track_fallback=q,
+        )
+    except Exception as e:
+        log.warning("artist_albums_failed", query=q, error=str(e))
+        return False
+
+
 @router.message(F.chat.type == "private", F.text & ~F.text.startswith("/"))
 async def handle_playlist_text(message: Message):
     """Текст: плейлист, одиночный запрос или VK-ссылка."""
@@ -744,10 +763,13 @@ async def handle_playlist_text(message: Message):
             return
         if not _storage.has_channel(message.from_user.id, channel_id):
             _storage.add_channel(message.from_user.id, channel_id)
-        if _should_resolve_lyrics(track_lines[0]):
-            await _show_lyric_stage(message, track_lines[0], channel_id)
-        else:
-            await _show_picker(message, track_lines[0], channel_id)
+        line = track_lines[0]
+        if _should_resolve_lyrics(line):
+            await _show_lyric_stage(message, line, channel_id)
+            return
+        if await _maybe_artist_albums(message, line, channel_id):
+            return
+        await _show_picker(message, line, channel_id)
         return
 
     await _start_processing(message, raw_text, channel_hint=channel_hint)
