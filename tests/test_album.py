@@ -267,6 +267,42 @@ def test_album_serialization_roundtrip():
     assert back.tracks[0].feat == ["Sabu"]
 
 
+def test_album_mode_cycle_and_labels():
+    from bot.handlers.album import _mode_label, _next_mode
+
+    assert _next_mode("youtube") == "vk"
+    assert _next_mode("vk") == "soundcloud"
+    assert _next_mode("soundcloud") == "youtube"
+    assert _next_mode("") == "youtube"
+    assert "YouTube" in _mode_label("youtube")
+    assert "SoundCloud" in _mode_label("soundcloud")
+    assert _mode_label("vk") == "VK"
+
+
+def test_resolve_casing_skips_when_has_upper():
+    import asyncio
+
+    from bot.handlers.album import _resolve_casing
+
+    assert asyncio.run(_resolve_casing("TAKETAKE")) == "TAKETAKE"
+    assert asyncio.run(_resolve_casing("")) == ""
+
+
+def test_search_albums_does_not_cache_empty(monkeypatch):
+    import asyncio
+
+    import services.album as album_mod
+
+    async def none_fetch(url, proxy=""):
+        return None
+
+    monkeypatch.setattr(album_mod, "_fetch", none_fetch)
+    album_mod._search_cache.clear()
+    assert asyncio.run(album_mod.search_albums("zzzznope")) == []
+    # пустой результат не должен «залипать» в кэше на 10 минут
+    assert "zzzznope" not in album_mod._search_cache
+
+
 def test_maybe_artist_albums_guards():
     import asyncio
 

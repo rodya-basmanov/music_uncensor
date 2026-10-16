@@ -192,10 +192,21 @@ async def cb_lib_album(callback: CallbackQuery):
     fav = data["favs"][i]
     await callback.answer("💿 Открываю…")
     from bot.handlers import album as album_handler
-    await album_handler.open_album(
-        callback.message, f"{fav['artist']} {fav['title']}".strip(),
-        channel_id, callback.from_user.id,
-    )
+    label = f"{fav['artist']} — {fav['title']}".strip(" —")
+    try:
+        ok = await album_handler.open_album(
+            callback.message, f"{fav['artist']} {fav['title']}".strip(),
+            channel_id, callback.from_user.id,
+        )
+    except Exception as e:
+        log.warning("fav_open_failed", error=str(e))
+        ok = False
+    if not ok:
+        await callback.message.answer(
+            f"❌ Не нашёл альбом «{esc_html(label)}».\n"
+            f"Попробуй /album {esc_html(fav['artist'])}",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @router.callback_query(F.data.startswith("lib_favdel|"))

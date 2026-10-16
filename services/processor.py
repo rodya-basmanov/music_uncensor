@@ -1432,7 +1432,12 @@ async def _process_single_track(
         artist_hint = clean_artist_for_search(track.artist)
         query = f"{artist_hint} {clean_title_for_search(track.title)}".strip()
 
-    order = _effective_order(source_order, bool(track.query) or is_mashup(track.title) or is_mashup(track.artist))
+    if mode == "youtube":
+        order = ["youtube"]
+    elif mode == "soundcloud":
+        order = ["soundcloud"]
+    else:
+        order = _effective_order(source_order, bool(track.query) or is_mashup(track.title) or is_mashup(track.artist))
     sources = [s for s in order if _provider(s)]
 
     async def _search_src(src: str) -> list:
@@ -1475,8 +1480,8 @@ async def _process_single_track(
                 if cancel is not None and cancel():
                     return "cancelled"
 
-        # Fallback: ничего не нашли в uncensored-источниках → отдаём версию из VK
-        if mode != "vk" and vk_available and not (cancel is not None and cancel()):
+        # Fallback: ничего не нашли → отдаём версию из VK (только для combined-режима)
+        if mode == "uncensored" and vk_available and not (cancel is not None and cancel()):
             async with _download_sem:
                 info = await _download_vk_and_send(
                     track, channel_id, cache_mgr, sender, hash_key, ytdlp_proxy, user_id,

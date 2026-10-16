@@ -576,7 +576,9 @@ async def search_albums(query: str, proxy: str = "", limit: int = 5) -> list[Alb
         await asyncio.gather(*tasks, return_exceptions=True)
 
     albums = _rank_albums(query, pool)[:limit] if pool else []
-    _search_cache[key] = (time.time(), albums)
+    # пустой результат не кэшируем: разовый сбой Deezer не должен «гасить» запрос на 10 мин
+    if albums:
+        _search_cache[key] = (time.time(), albums)
     if albums and _db is not None:
         try:
             _db.cache_set("alb:" + key, _albums_to_dicts(albums), _CACHE_TTL)

@@ -214,11 +214,25 @@ def _album_caption(album: AlbumInfo, show_selection: bool = False, selected: set
     return b.build()
 
 
+# Источники для альбома — реальные (переключаются кнопкой «🎚 Источник»).
+_ALBUM_MODES = ["youtube", "vk", "soundcloud"]
+_MODE_LABELS = {"youtube": "▶️ YouTube", "vk": "VK", "soundcloud": "☁️ SoundCloud"}
+
+
 def _mode_label(mode: str) -> str:
-    return "VK" if mode == "vk" else "🔀 Uncensored"
+    return _MODE_LABELS.get(mode, _MODE_LABELS["youtube"])
 
 
-def _card_keyboard(token: str, album: AlbumInfo, mode: str = "uncensored",
+def _next_mode(mode: str) -> str:
+    """Следующий источник по кругу: YouTube → VK → SoundCloud → …"""
+    try:
+        i = _ALBUM_MODES.index(mode)
+    except ValueError:
+        i = -1
+    return _ALBUM_MODES[(i + 1) % len(_ALBUM_MODES)]
+
+
+def _card_keyboard(token: str, album: AlbumInfo, mode: str = "youtube",
                    can_alt: bool = False, fav: bool = False) -> InlineKeyboardMarkup:
     n = len(album.tracks)
     rows = [
@@ -249,7 +263,7 @@ def _is_fav(data: dict, album: AlbumInfo) -> bool:
         return False
 
 
-def _select_keyboard(token: str, album: AlbumInfo, selected: set, mode: str = "uncensored") -> InlineKeyboardMarkup:
+def _select_keyboard(token: str, album: AlbumInfo, selected: set, mode: str = "youtube") -> InlineKeyboardMarkup:
     rows = []
     for i, t in enumerate(album.tracks):
         mark = "✅" if i in selected else "⬜"
@@ -273,7 +287,7 @@ def _select_keyboard(token: str, album: AlbumInfo, selected: set, mode: str = "u
 async def _render_album_view(message: Message, token: str, data: dict) -> None:
     """Перерисовывает карточку/выбор треков с учётом текущего источника."""
     album = data["album"]
-    mode = data.get("mode", "uncensored")
+    mode = data.get("mode", "youtube")
     rzt = data.get("rzt")
     if data.get("view") == "select":
         text, ents = _album_caption(album, show_selection=True, selected=data["selected"], rzt=rzt)
@@ -345,14 +359,14 @@ async def _enrich_album(bot, sent, token: str, album: AlbumInfo, user_id: int) -
             text, ents = _album_caption(album, show_selection=True, selected=data["selected"], rzt=rzt)
             await _edit_card(
                 sent, album, text, ents,
-                _select_keyboard(token, album, data["selected"], data.get("mode", "uncensored")),
+                _select_keyboard(token, album, data["selected"], data.get("mode", "youtube")),
             )
         else:
             text, ents = _album_caption(album, rzt=rzt)
             can_alt = len(data.get("alternatives") or []) > 1
             await _edit_card(
                 sent, album, text, ents,
-                _card_keyboard(token, album, data.get("mode", "uncensored"), can_alt, _is_fav(data, album)),
+                _card_keyboard(token, album, data.get("mode", "youtube"), can_alt, _is_fav(data, album)),
             )
     except Exception:
         pass
@@ -375,13 +389,13 @@ async def _present_album(message: Message, alb: AlbumInfo, channel_id: int, user
         "album": full,
         "alternatives": alts,
         "selected": set(range(len(full.tracks))),
-        "mode": "uncensored",
+        "mode": "youtube",
         "view": "card",
         "rzt": None,
         "created": time.time(),
     }
     text, ents = _album_caption(full)
-    kb = _card_keyboard(token, full, "uncensored", len(alts) > 1, _is_fav(_pending[token], full))
+    kb = _card_keyboard(token, full, "youtube", len(alts) > 1, _is_fav(_pending[token], full))
     try:
         await message.delete()
     except Exception:
@@ -513,10 +527,19 @@ async def show_artist_albums(message: Message, query: str, channel_id: int, user
 
 async def open_album(message: Message, query: str, channel_id: int, user_id: int) -> bool:
     """Открывает альбом по строке «Артист Название» (для /history и /favorites)."""
+    albums: list = []
     try:
         albums = await album_service.search_albums(query, _ytdlp_proxy)
-    except Exception:
-        albums = []
+    except Exception as e:
+        log.warning("open_album_search_error", query=query[:60], error=str(e))
+    if not albums:
+        # Фолбэк: возможно, Deezer не отдал альбом — пробуем как имя артиста.
+        try:
+            artist = await album_service.search_artist(query, _ytdlp_proxy)
+            if artist:
+                albums = await album_service.search_artist_albums(query, _ytdlp_proxy)
+        except Exception:
+            albums = []
     if not albums:
         return False
     if len(albums) == 1 or album_service._album_score(query, albums[0]) >= _AUTO_PICK_SCORE:
@@ -777,7 +800,7 @@ async def cb_album_none(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("album_mode|"))
 async def cb_album_mode(callback: CallbackQuery):
-    """Переключает источник скачивания: uncensored ⇄ VK."""
+    """Переключает источник скачивания: YouTube → VK → SoundCloud по кругу."""
     token, data = _cb_token(callback, "album_mode|")
     if token is None:
         await callback.answer("Ошибка данных.", show_alert=True)
@@ -785,7 +808,7 @@ async def cb_album_mode(callback: CallbackQuery):
     if not data or "album" not in data:
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
-    data["mode"] = "vk" if data.get("mode") != "vk" else "uncensored"
+    data["mode"] = _next_mode(data.get("mode", "youtube"))
     await callback.answer(f"Источник: {_mode_label(data['mode'])}")
     await _render_album_view(callback.message, token, data)
 
@@ -844,27 +867,71 @@ async def cb_album_close(callback: CallbackQuery):
         pass
 
 
+async def _resolve_casing(artist: str) -> str:
+    """Best-effort правильный регистр имени артиста (Deezer, затем VK).
+
+    Deezer часто отдаёт имя строчными (напр. «taketake»); без этого в метаданные
+    скачанного трека ушёл бы неправильный регистр, пока фоновое обогащение ещё
+    не успело отработать.
+    """
+    artist = (artist or "").strip()
+    if not artist or any(ch.isupper() for ch in artist):
+        return artist
+    # 1) VK: обычно отдаёт канонический регистр («taketake» → «TAKETAKE»)
+    try:
+        fixed = await asyncio.wait_for(
+            album_service.pretty_artist(artist, _ytdlp_proxy, _vk_fetcher), timeout=8,
+        )
+        if fixed and any(ch.isupper() for ch in fixed):
+            return fixed
+    except Exception:
+        pass
+    # 2) Deezer artist name (иногда с правильным регистром, но часто строчными)
+    try:
+        a = await album_service.search_artist(artist, _ytdlp_proxy)
+        name = (a or {}).get("name") or ""
+        if name and any(ch.isupper() for ch in name):
+            return name
+    except Exception:
+        pass
+    return artist
+
+
+async def _apply_casing(album: AlbumInfo, data: dict) -> None:
+    """Синхронно правит регистр артиста в карточке и в её сессии."""
+    fixed = await _resolve_casing(album.artist)
+    if fixed and fixed != album.artist:
+        album.artist = fixed
+        if isinstance(data.get("album"), AlbumInfo):
+            data["album"].artist = fixed
+
+
 async def _launch(
     callback: CallbackQuery,
     data: dict,
-    tracks: list[Track],
-    name: str,
+    album: AlbumInfo,
+    indices=None,
     channel_header: bool = True,
 ) -> None:
+    if not album.tracks:
+        await callback.answer("Ничего не выбрано.", show_alert=True)
+        return
+    await _apply_casing(album, data)
+    tracks = _album_tracks(album, indices)
     if not tracks:
         await callback.answer("Ничего не выбрано.", show_alert=True)
         return
-    mode = data.get("mode", "uncensored")
+    mode = data.get("mode", "youtube")
     await callback.answer("🚀 Запускаю…")
     # Карточку альбома НЕ удаляем — прогресс пойдёт отдельным сообщением в ЛС.
     await playlist._start_processing(
         callback.message, "",
         channel_hint=str(data["channel_id"]),
-        playlist_name_override=name,
+        playlist_name_override=f"{album.artist} — {album.title}",
         tracks_override=tracks,
         mode=mode,
         user_id=data["user_id"],
-        cover_url=data["album"].cover_url,
+        cover_url=album.cover_url,
         channel_header=channel_header,
     )
 
@@ -894,7 +961,7 @@ async def cb_album_dl(callback: CallbackQuery):
         await callback.answer("⌛ Устарело.", show_alert=True)
         return
     album = data["album"]
-    await _launch(callback, data, _album_tracks(album), f"{album.artist} — {album.title}")
+    await _launch(callback, data, album)
 
 
 @router.callback_query(F.data.startswith("album_dlsel|"))
@@ -909,10 +976,7 @@ async def cb_album_dlsel(callback: CallbackQuery):
     album = data["album"]
     selected = data["selected"]
     # Частичная загрузка — шапку/обложку альбома в канал НЕ отправляем.
-    await _launch(
-        callback, data, _album_tracks(album, selected),
-        f"{album.artist} — {album.title}", channel_header=False,
-    )
+    await _launch(callback, data, album, selected, channel_header=False)
 
 
 @router.callback_query(F.data.startswith("album_src|"))
@@ -929,6 +993,7 @@ async def cb_album_src(callback: CallbackQuery):
         await callback.answer("⏳ У вас уже выполняется задача. Дождитесь или /cancel.", show_alert=True)
         return
     album = data["album"]
+    await _apply_casing(album, data)
     await callback.answer("🎛 Выбираем источник по трекам…")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
