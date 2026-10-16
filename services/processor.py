@@ -1,6 +1,7 @@
 """Процессор плейлистов: полный цикл обработки треков."""
 
 import asyncio
+import dataclasses
 import html
 import os
 import random
@@ -132,17 +133,34 @@ def _cache_key(source: str, query: str) -> tuple:
 
 
 def _cache_get(source: str, query: str):
-    item = _search_cache.get(_cache_key(source, query))
+    key = _cache_key(source, query)
+    item = _search_cache.get(key)
     if item and time.time() - item[0] < _SEARCH_CACHE_TTL:
         return item[1]
+    if _db is not None:
+        try:
+            stored = _db.cache_get("cand:" + f"{source}|{key[1]}")
+            if stored is not None:
+                cands = [Candidate(**c) for c in stored]
+                _search_cache[key] = (time.time(), cands)
+                return cands
+        except Exception:
+            pass
     return None
 
 
 def _cache_put(source: str, query: str, candidates: list) -> None:
+    key = _cache_key(source, query)
     if len(_search_cache) >= _SEARCH_CACHE_MAX:
         for k, _ in sorted(_search_cache.items(), key=lambda kv: kv[1][0])[:50]:
             _search_cache.pop(k, None)
-    _search_cache[_cache_key(source, query)] = (time.time(), candidates)
+    _search_cache[key] = (time.time(), candidates)
+    if candidates and _db is not None:
+        try:
+            _db.cache_set("cand:" + f"{source}|{key[1]}",
+                          [dataclasses.asdict(c) for c in candidates], _SEARCH_CACHE_TTL)
+        except Exception:
+            pass
 
 
 def _provider(name: str):
@@ -280,6 +298,28 @@ _stats = {
 
 _stats_path: str = ""
 _last_stats_save: float = 0.0
+_db = None  # SQLite (utils.db.Database) — статистика + история
+
+
+def set_db(db) -> None:
+    """Подключает SQLite для статистики и истории (с миграцией из stats.json)."""
+    global _db
+    _db = db
+    try:
+        stored = db.get_stats()
+        if not stored and _stats_path and os.path.exists(_stats_path):
+            import json
+            with open(_stats_path, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            for k in _stats:
+                if isinstance(old.get(k), (int, float)):
+                    _stats[k] = int(old[k])
+            db.set_stats(_stats)
+        for k in _stats:
+            if isinstance(stored.get(k), (int, float)):
+                _stats[k] = int(stored[k])
+    except Exception as e:
+        log.warning("stats_load_error", error=str(e))
 
 # Подпись под аудио (song.link + via @bot)
 _caption_enabled: bool = True
@@ -441,14 +481,20 @@ def _prune_exports(keep: int = _EXPORTS_KEEP) -> None:
 
 
 def _save_stats(force: bool = False) -> None:
-    """Сохраняет статистику на диск (не чаще раза в 2 секунды)."""
+    """Сохраняет статистику (SQLite или JSON) не чаще раза в 2 секунды."""
     global _last_stats_save
-    if not _stats_path:
-        return
     now = time.time()
     if not force and now - _last_stats_save < 2:
         return
     _last_stats_save = now
+    if _db is not None:
+        try:
+            _db.set_stats(_stats)
+        except Exception as e:
+            log.warning("stats_save_error", error=str(e))
+        return
+    if not _stats_path:
+        return
     try:
         import json
         os.makedirs(os.path.dirname(_stats_path), exist_ok=True)
@@ -728,6 +774,12 @@ def _apply_result(status: TaskStatus, track: Track, result: str) -> None:
         "title": track.title or "",
         "status": entry_status,
     })
+    if entry_status == "sent" and _db is not None:
+        try:
+            _db.add_history(status.user_id, track.artist or "", track.title or "",
+                            getattr(track, "source", "") or "", status.channel_id)
+        except Exception:
+            pass
 
 
 async def _process_tracks(
@@ -1208,6 +1260,12 @@ async def process_picked_candidate(
     )
     if not info:
         _bump(total_not_found=1)
+    elif _db is not None:
+        try:
+            _db.add_history(user_id, info.get("artist", ""), info.get("title", ""),
+                            info.get("source", ""), channel_id)
+        except Exception:
+            pass
     return info
 
 

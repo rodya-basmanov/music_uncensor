@@ -17,10 +17,11 @@ from aiogram.types import BotCommand
 from python_socks import ProxyError
 from sentry_sdk import capture_exception
 
-from bot.handlers import album, cancel, link, playlist, start, stats, status
+from bot.handlers import album, cancel, library, link, playlist, start, stats, status
 from bot.handlers import health as health_handler
 from core.cache_manager import CacheManager
 from core.scraper.common import set_pot_provider
+from services import album as album_service
 from services import health as health_service
 from services import processor, tg_sender
 from services import rzt as rzt_service
@@ -147,6 +148,7 @@ async def main():
     link.set_storage(storage)
     processor.set_vk_token(config.vk_token)
     processor.set_stats_path(os.path.join(config.data_dir, "stats.json"))
+    processor.set_db(storage.db)
     processor.set_exports_dir(os.path.join(config.data_dir, "exports"))
     processor.set_caption(config.audio_caption)
     processor.set_vk_cover_min_score(config.vk_cover_min_score)
@@ -172,9 +174,11 @@ async def main():
         vk_token=config.vk_token, owner_id=config.owner_id,
     )
     stats.set_dependencies(storage, config.owner_id)
+    library.set_dependencies(storage)
     album.set_dependencies(
         storage=storage, ytdlp_proxy=config.ytdlp_proxy, vk_token=config.vk_token,
     )
+    album_service.set_db(storage.db)
 
     try:
         await bot.set_my_commands([
@@ -186,6 +190,8 @@ async def main():
             BotCommand(command="status", description="Статус задачи"),
             BotCommand(command="stats", description="Статистика"),
             BotCommand(command="album", description="Скачать альбом"),
+            BotCommand(command="history", description="История загрузок"),
+            BotCommand(command="favorites", description="Избранные альбомы"),
             BotCommand(command="health", description="Состояние бота"),
             BotCommand(command="cancel", description="Отменить задачу"),
         ])
@@ -201,6 +207,7 @@ async def main():
     dp.include_router(health_handler.router)
     dp.include_router(album.router)
     dp.include_router(playlist.router)
+    dp.include_router(library.router)
 
     _shutdown_event = asyncio.Event()
     loop = asyncio.get_event_loop()
@@ -249,6 +256,17 @@ async def main():
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     spawn(sweeper_loop(300), name="pending_sweeper")
+
+    async def _kv_prune_loop():
+        """Чистка просроченного персистентного кэша поиска (раз в 30 мин)."""
+        while True:
+            await asyncio.sleep(1800)
+            try:
+                storage.db.cache_prune()
+            except Exception:
+                pass
+
+    spawn(_kv_prune_loop(), name="kv_prune")
 
     if config.webhook_mode and config.webhook_url and not config.webhook_secret:
         _log.error(
