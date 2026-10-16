@@ -83,6 +83,15 @@ def test_format_duration():
     assert format_duration(3900) == "1ч 5мин"
 
 
+def test_read_text_file_encodings(tmp_path):
+    from utils.helpers import read_text_file
+
+    p = tmp_path / "a.txt"
+    for enc in ("utf-8", "utf-8-sig", "utf-16"):
+        p.write_bytes("Artist - Title\nB - C\n".encode(enc))
+        assert read_text_file(str(p)) == "Artist - Title\nB - C\n"
+
+
 def test_translit_cyrillic():
     assert translit("салуки") == "saluki"
     assert translit("Эйфория") == "Eyforiya"

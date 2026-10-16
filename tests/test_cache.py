@@ -66,3 +66,28 @@ async def test_cache_cleanup_keeps_fresh(tmp_path):
     deleted = await cm.cleanup()
     assert deleted == 0
     assert cm.get(hk) is not None
+
+
+async def test_orphan_grace_keeps_fresh_file(tmp_path):
+    cm = CacheManager(cache_dir=str(tmp_path), ttl_days=7, max_size_gb=1)
+    orphan = os.path.join(str(tmp_path), "e" * 64 + ".mp3")
+    with open(orphan, "wb") as f:
+        f.write(b"x" * 10)
+
+    # Свежая «сирота» (возможна активная запись) — не удаляем.
+    deleted = await cm.cleanup()
+    assert deleted == 0
+    assert os.path.exists(orphan)
+
+
+async def test_orphan_removed_when_old(tmp_path):
+    cm = CacheManager(cache_dir=str(tmp_path), ttl_days=7, max_size_gb=1)
+    orphan = os.path.join(str(tmp_path), "f" * 64 + ".mp3")
+    with open(orphan, "wb") as f:
+        f.write(b"x" * 10)
+    old = time.time() - 2 * 3600
+    os.utime(orphan, (old, old))
+
+    deleted = await cm.cleanup()
+    assert deleted >= 1
+    assert not os.path.exists(orphan)

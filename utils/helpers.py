@@ -147,3 +147,14 @@ def crop_text(text: str, width: int) -> str:
         return "…"
     return text[:width - 1].rstrip() + "…"
 
+
+def read_text_file(path: str) -> str:
+    """Читает .txt с автоопределением кодировки (UTF-8/UTF-16 по BOM)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="ignore")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="ignore")
+    return raw.decode("utf-8", errors="ignore")
+

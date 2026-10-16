@@ -3,12 +3,17 @@
 import asyncio
 import json
 import os
+import shutil
 import time
 from typing import Any, Dict, Optional
 
 from utils.logger import get_logger
 
 log = get_logger("cache")
+
+# Не трогаем «сироты» моложе этого времени: их .json мог ещё не записаться,
+# а загрузка — идти прямо сейчас.
+_ORPHAN_GRACE_SEC = 3600
 
 
 class CacheManager:
@@ -121,62 +126,93 @@ class CacheManager:
         return {"size_gb": self.get_cache_size_gb(), "files": files}
 
     async def cleanup(self) -> int:
-        """
-        Очистка кэша: удаляет записи старше TTL или при превышении размера.
-
-        Returns:
-            Количество удалённых файлов
-        """
+        """Очистка кэша: TTL + по размеру + сироты. Работа идёт в отдельном потоке."""
         async with self._lock:
-            # Сброс кэша размера для точного измерения
             self._cached_size_gb = None
-            deleted = 0
-            now = time.time()
-            ttl_seconds = self.ttl_days * 86400
-            entries = []
+            return await asyncio.to_thread(self._cleanup_sync)
 
-            # Собираем все записи
-            for filename in os.listdir(self.cache_dir):
-                if not filename.endswith(".json"):
+    def _cleanup_sync(self) -> int:
+        deleted = 0
+        now = time.time()
+        ttl_seconds = self.ttl_days * 86400
+        names = os.listdir(self.cache_dir)
+        known = {f[:-5] for f in names if f.endswith(".json")}
+
+        def _too_new(path: str) -> bool:
+            """Файл/папка моложе grace-периода — не трогаем (возможна активная запись)."""
+            try:
+                return (now - os.path.getmtime(path)) < _ORPHAN_GRACE_SEC
+            except OSError:
+                return True
+
+        # 0. Сироты: mp3/jpg без .json и временные work_* папки (только «старые»)
+        for name in names:
+            path = os.path.join(self.cache_dir, name)
+            if name.startswith("work_") and os.path.isdir(path):
+                if not _too_new(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                continue
+            base, ext = os.path.splitext(name)
+            if ext.lower() in (".mp3", ".jpg", ".jpeg", ".png") and base not in known:
+                if _too_new(path):
                     continue
-
-                hash_key = filename[:-5]
-                meta_path = self._meta_path(hash_key)
-                file_path = self._file_path(hash_key)
-                cover_path = self._cover_path(hash_key)
-
                 try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    accessed_at = data.get("accessed_at", 0)
-                    entries.append((hash_key, accessed_at, meta_path, file_path, cover_path))
-                except Exception:
-                    continue
-
-            # 1. Удаляем по TTL
-            for hash_key, accessed_at, meta_path, file_path, cover_path in entries:
-                if now - accessed_at > ttl_seconds:
-                    self._delete_entry(meta_path, file_path, cover_path)
+                    os.unlink(path)
                     deleted += 1
-                    continue
+                except OSError:
+                    pass
 
-            # 2. Удаляем старые при превышении размера
-            if self.get_cache_size_gb() > self.max_size_gb:
-                remaining = [
-                    (hk, at, mp, fp, cp) for hk, at, mp, fp, cp in entries
-                    if os.path.exists(mp)
-                ]
-                remaining.sort(key=lambda x: x[1])
+        entries = []
+        for filename in names:
+            if not filename.endswith(".json"):
+                continue
+            hash_key = filename[:-5]
+            meta_path = self._meta_path(hash_key)
+            file_path = self._file_path(hash_key)
+            cover_path = self._cover_path(hash_key)
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                entries.append((hash_key, data.get("accessed_at", 0), meta_path, file_path, cover_path))
+            except Exception:
+                continue
 
-                while remaining and self.get_cache_size_gb() > self.max_size_gb * 0.8:
-                    _, _, meta_path, file_path, cover_path = remaining.pop(0)
-                    self._delete_entry(meta_path, file_path, cover_path)
-                    deleted += 1
+        # 1. Удаляем по TTL
+        survivors = []
+        for entry in entries:
+            if now - entry[1] > ttl_seconds:
+                self._delete_entry(entry[2], entry[3], entry[4])
+                deleted += 1
+            else:
+                survivors.append(entry)
 
-            if deleted:
-                log.info("cache_cleanup_done", deleted=deleted, size_gb=round(self.get_cache_size_gb(), 2))
+        # 2. По размеру: считаем объём один раз и вычитаем при удалении (не O(n²))
+        sizes: dict[str, int] = {}
+        total = 0
+        for hk, at, mp, fp, cp in survivors:
+            sz = 0
+            for p in (fp, cp, mp):
+                try:
+                    sz += os.path.getsize(p)
+                except OSError:
+                    pass
+            sizes[hk] = sz
+            total += sz
 
-            return deleted
+        limit = self.max_size_gb * (1024 ** 3)
+        if total > limit:
+            target = limit * 0.8
+            survivors.sort(key=lambda x: x[1])  # старейшие — первыми
+            for hk, at, mp, fp, cp in survivors:
+                if total <= target:
+                    break
+                self._delete_entry(mp, fp, cp)
+                deleted += 1
+                total -= sizes.get(hk, 0)
+
+        if deleted:
+            log.info("cache_cleanup_done", deleted=deleted)
+        return deleted
 
     def _delete_entry(self, *paths: str) -> None:
         """Удаляет файлы записи кэша."""

@@ -1,4 +1,4 @@
-"""Атомарное чтение/запись users.json."""
+"""Чтение/запись users.json с кэшем в памяти (write-through)."""
 
 import json
 import os
@@ -12,34 +12,47 @@ log = get_logger("storage")
 
 
 class UserStorage:
-    """Хранилище привязок user_id → channels в JSON-файле."""
+    """Хранилище привязок user_id → channels.
+
+    Данные держатся в памяти (один процесс/loop), на диск пишем при изменениях —
+    это убирает синхронное чтение файла на каждое сообщение.
+    """
 
     def __init__(self, filepath: str = "./data/users.json"):
         self.filepath = filepath
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        self._data: Dict[str, Any] = self._load()
         if not os.path.exists(filepath):
-            self._write({})
+            self._persist(self._data)
 
-    def _read(self) -> Dict[str, Any]:
-        """Читает JSON-файл."""
+    def _load(self) -> Dict[str, Any]:
+        """Читает JSON-файл один раз при старте."""
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, FileNotFoundError):
             return {}
+        except OSError as e:
+            log.warning("storage_read_error", error=str(e))
+            return {}
+
+    def _read(self) -> Dict[str, Any]:
+        return self._data
 
     def _write(self, data: Dict[str, Any]) -> None:
-        """Атомарная запись через temp-файл + rename."""
-        dir_name = os.path.dirname(self.filepath)
+        """Обновляет память и сохраняет на диск."""
+        self._data = data
+        self._persist(data)
+
+    def _persist(self, data: Dict[str, Any]) -> None:
+        """Атомарная запись через temp-файл + replace."""
+        dir_name = os.path.dirname(self.filepath) or "."
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            # На Windows нужно удалить целевой файл перед rename
-            if os.path.exists(self.filepath):
-                os.replace(tmp_path, self.filepath)
-            else:
-                os.rename(tmp_path, self.filepath)
+            os.replace(tmp_path, self.filepath)
         except Exception:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -67,6 +80,12 @@ class UserStorage:
         uid = str(user_id)
         if uid in data and channel_id in data[uid]["channels"]:
             data[uid]["channels"].remove(channel_id)
+            if data[uid].get("default_channel") == channel_id:
+                remaining = data[uid]["channels"]
+                if remaining:
+                    data[uid]["default_channel"] = remaining[0]
+                else:
+                    data[uid].pop("default_channel", None)
             self._write(data)
             log.info("channel_unlinked", user_id=user_id, channel_id=channel_id)
             return True

@@ -1,6 +1,8 @@
 """Получение треков из плейлиста ВКонтакте через vk_api."""
 
 import asyncio
+import threading
+import time
 from typing import Any, List, Optional
 
 import vk_api
@@ -42,16 +44,38 @@ class VKFetcher:
 
     def __init__(self, token: str):
         self.token = token
-        self._session: Any = None
-        self._api: Any = None
         self.auth_failed: bool = False
         self.last_error: str = ""
+        self._local = threading.local()
 
-    def _ensure_session(self) -> None:
-        """Создаёт сессию VK API если ещё не создана."""
-        if self._session is None:
-            self._session = vk_api.VkApi(token=self.token, api_version="5.131")
-            self._api = self._session.get_api()
+    def _get_api(self) -> Any:
+        """Возвращает VK-клиент для текущего потока.
+
+        ``vk_api`` не потокобезопасен (общий requests.Session), поэтому вместо
+        глобального лока держим по отдельной сессии на поток — это разрешает
+        параллельные вызовы VK (плейлист + обогащение альбома + поиск).
+        """
+        api = getattr(self._local, "api", None)
+        if api is None:
+            session = vk_api.VkApi(token=self.token, api_version="5.131")
+            api = session.get_api()
+            self._local.api = api
+        return api
+
+    def _invoke(self, fn):
+        """Вызов VK API с ретраями на сеть. ``fn`` получает потокобезопасный клиент."""
+        last: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return fn(self._get_api())
+            except vk_api.exceptions.ApiError:
+                raise
+            except Exception as e:
+                last = e
+                time.sleep(0.4 * (attempt + 1))
+        if last:
+            raise last
+        raise RuntimeError("vk call failed")
 
     def get_playlist_tracks(
         self,
@@ -72,7 +96,6 @@ class VKFetcher:
         Returns:
             Список Track
         """
-        self._ensure_session()
         tracks: List[Track] = []
         seen_ids: set = set()
         offset = 0
@@ -91,6 +114,7 @@ class VKFetcher:
                 if not items:
                     break
 
+                before = len(tracks)
                 for item in items:
                     key = f"{item.get('owner_id')}_{item.get('id')}"
                     if key in seen_ids:
@@ -112,6 +136,10 @@ class VKFetcher:
                     ))
 
                 if len(items) < want:
+                    break
+                # getPlaylistById игнорирует offset и отдаёт весь список каждый раз:
+                # если страница не дала новых треков — прекращаем, иначе вечный цикл.
+                if len(tracks) == before:
                     break
                 offset += len(items)
 
@@ -158,17 +186,17 @@ class VKFetcher:
             playlist_by_id_params["access_key"] = access_key
 
         method_attempts = [
-            ("audio.get", lambda: self._api.audio.get(**audio_get_params)),
+            ("audio.get", lambda api: api.audio.get(**audio_get_params)),
             (
                 "audio.getPlaylistById",
-                lambda: self._api.audio.getPlaylistById(**playlist_by_id_params),
+                lambda api: api.audio.getPlaylistById(**playlist_by_id_params),
             ),
         ]
 
         last_error = None
         for method_name, caller in method_attempts:
             try:
-                response = caller()
+                response = self._invoke(caller)
                 log.info("vk_method_success", method=method_name)
 
                 if isinstance(response, dict):
@@ -209,9 +237,8 @@ class VKFetcher:
 
     def search(self, query: str, count: int = 5) -> List[Candidate]:
         """Поиск аудио в VK (audio.search). Возвращает кандидатов с прямыми ссылками."""
-        self._ensure_session()
         try:
-            response = self._api.audio.search(q=query, count=count)
+            response = self._invoke(lambda api: api.audio.search(q=query, count=count))
             self.last_error = ""
         except vk_api.exceptions.ApiError as e:
             self.last_error = str(e)
@@ -254,9 +281,8 @@ class VKFetcher:
 
         Каждая группа: owner_id, album_id, access_key, title, cover_url, artists, tracks.
         """
-        self._ensure_session()
         try:
-            response = self._api.audio.search(q=query, count=count)
+            response = self._invoke(lambda api: api.audio.search(q=query, count=count))
             self.last_error = ""
         except vk_api.exceptions.ApiError as e:
             self.last_error = str(e)
@@ -308,10 +334,9 @@ class VKFetcher:
 
     def get_track(self, owner_id: int, audio_id: int, access_key: Optional[str] = None) -> Optional[Track]:
         """Получает одиночный трек по (owner_id, audio_id) через audio.getById."""
-        self._ensure_session()
         ref = f"{owner_id}_{audio_id}" + (f"_{access_key}" if access_key else "")
         try:
-            response = self._api.audio.getById(audios=ref)
+            response = self._invoke(lambda api: api.audio.getById(audios=ref))
         except Exception as e:
             log.warning("vk_getbyid_error", ref=ref, error=str(e))
             return None

@@ -13,11 +13,26 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class Config:
     """Конфигурация приложения."""
     # Telegram
     bot_token: str = ""
+    owner_id: int = 0
     telegram_proxy_url: str = ""
     telegram_proxy_required: bool = False
 
@@ -77,6 +92,7 @@ def load_config() -> Config:
 
     return Config(
         bot_token=os.getenv("BOT_TOKEN", ""),
+        owner_id=_env_int("OWNER_ID", 0),
         data_dir=os.getenv("DATA_DIR", "./data"),
         telegram_proxy_url=telegram_proxy,
         telegram_proxy_required=_env_bool("TELEGRAM_PROXY_REQUIRED", False),
@@ -87,16 +103,16 @@ def load_config() -> Config:
         ytdlp_pot_provider=os.getenv("YTDLP_POT_PROVIDER", ""),
         source_order=source_order or ["youtube", "soundcloud"],
 
-        max_playlist_size=int(os.getenv("MAX_PLAYLIST_SIZE", "500")),
-        concurrency=max(1, int(os.getenv("CONCURRENCY", "3"))),
-        send_interval=max(0.0, float(os.getenv("SEND_INTERVAL", "1"))),
+        max_playlist_size=max(1, _env_int("MAX_PLAYLIST_SIZE", 500)),
+        concurrency=max(1, _env_int("CONCURRENCY", 3)),
+        send_interval=max(0.0, _env_float("SEND_INTERVAL", 1.0)),
         audio_caption=_env_bool("AUDIO_CAPTION", True),
         via_username=os.getenv("VIA_USERNAME", ""),
-        vk_cover_min_score=int(os.getenv("VK_COVER_MIN_SCORE", "90")),
+        vk_cover_min_score=_env_int("VK_COVER_MIN_SCORE", 90),
         cache_dir=os.getenv("CACHE_DIR", "./data/cache"),
-        cache_ttl_days=int(os.getenv("CACHE_TTL_DAYS", "7")),
-        max_cache_size_gb=int(os.getenv("MAX_CACHE_SIZE_GB", "20")),
-        rate_limit_search=float(os.getenv("RATE_LIMIT_SEARCH_SEC", "0.5")),
+        cache_ttl_days=max(0, _env_int("CACHE_TTL_DAYS", 7)),
+        max_cache_size_gb=max(1, _env_int("MAX_CACHE_SIZE_GB", 20)),
+        rate_limit_search=max(0.0, _env_float("RATE_LIMIT_SEARCH_SEC", 0.5)),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         sentry_dsn=os.getenv("SENTRY_DSN", ""),
         webhook_mode=_env_bool("WEBHOOK_MODE", False),

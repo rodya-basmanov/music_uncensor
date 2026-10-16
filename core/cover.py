@@ -2,6 +2,7 @@
 
 
 import asyncio
+from collections import OrderedDict
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -13,7 +14,7 @@ log = get_logger("cover")
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 _sessions: dict[str, aiohttp.ClientSession] = {}
-_raw_cache: dict[str, bytes] = {}
+_raw_cache: "OrderedDict[str, bytes]" = OrderedDict()
 _locks: dict[str, asyncio.Lock] = {}
 _RAW_CACHE_MAX = 64
 
@@ -71,9 +72,11 @@ async def download_image(url: str, dest_path: str, proxy: str = "",
                 data = await _fetch_bytes(url, proxy, timeout, retries)
                 if not data:
                     return False
-                if len(_raw_cache) >= _RAW_CACHE_MAX:
-                    _raw_cache.clear()
                 _raw_cache[url] = data
+                while len(_raw_cache) > _RAW_CACHE_MAX:
+                    _raw_cache.popitem(last=False)
+    else:
+        _raw_cache.move_to_end(url)
     try:
         with open(dest_path, "wb") as f:
             f.write(data)
