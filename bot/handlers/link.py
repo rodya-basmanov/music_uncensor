@@ -22,6 +22,33 @@ def set_storage(storage: UserStorage) -> None:
     _storage = storage
 
 
+async def _user_is_admin(bot, channel_id: int, user_id: int) -> bool:
+    """Проверяет, что пользователь — админ/создатель канала."""
+    try:
+        member = await bot.get_chat_member(channel_id, user_id)
+        status = str(getattr(member, "status", ""))
+        return status in ("creator", "administrator")
+    except Exception as e:
+        log.warning("user_admin_check_failed", channel_id=channel_id, user_id=user_id, error=str(e))
+        return False
+
+
+async def _bot_can_post(bot, channel_id: int) -> bool:
+    """Проверяет, что бот — админ канала и может публиковать сообщения."""
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(channel_id, me.id)
+        status = str(getattr(member, "status", ""))
+        if status == "creator":
+            return True
+        if status == "administrator":
+            return bool(getattr(member, "can_post_messages", False))
+        return False
+    except Exception as e:
+        log.warning("bot_can_post_check_failed", channel_id=channel_id, error=str(e))
+        return False
+
+
 @router.message(Command("link"))
 async def cmd_link(message: Message):
     """
@@ -52,8 +79,25 @@ async def cmd_link(message: Message):
         if abs(channel_id) < 100:
             await message.answer("❌ Неверный chat_id.")
             return
-        if _storage and user_id:
-            _storage.add_channel(user_id, channel_id)
+        if not _storage or not user_id:
+            await message.answer("❌ Не удалось определить пользователя.")
+            return
+        if not await _bot_can_post(message.bot, channel_id):
+            await message.answer(
+                f"❌ Бот не является администратором канала <code>{channel_id}</code> "
+                f"или не может публиковать сообщения.\n\n"
+                f"Добавьте бота в канал администратором (с правом публикации) и попробуйте снова.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not await _user_is_admin(message.bot, channel_id, user_id):
+            await message.answer(
+                "❌ Привязать канал может только его администратор. "
+                "Убедитесь, что вы админ этого канала.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        _storage.add_channel(user_id, channel_id)
         await message.answer(
             f"✅ Канал <code>{channel_id}</code> привязан и установлен по умолчанию.\n\n"
             f"Теперь просто отправляйте треки — они пойдут в этот канал.\n"
@@ -65,9 +109,23 @@ async def cmd_link(message: Message):
 
     # В канале/группе — сохраняем привязку
     chat_id = message.chat.id
-    if _storage and user_id:
-        _storage.add_channel(user_id, chat_id)
-
+    if user_id is None:
+        await message.answer(
+            "⚠️ Вы скрыты как администратор — не могу определить автора привязки.\n"
+            "Привяжите канал из лички бота: <code>/link -100XXXXXXXXXX</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not _storage:
+        await message.answer("⚠️ Хранилище недоступно.")
+        return
+    if not await _bot_can_post(message.bot, chat_id):
+        await message.answer("❌ Бот не может публиковать сообщения в этом канале.")
+        return
+    if not await _user_is_admin(message.bot, chat_id, user_id):
+        await message.answer("❌ Привязывать канал может только его администратор.")
+        return
+    _storage.add_channel(user_id, chat_id)
     await message.answer(
         f"✅ Chat ID этого канала:\n"
         f"<code>{chat_id}</code>\n\n"

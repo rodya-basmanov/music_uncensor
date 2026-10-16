@@ -2,13 +2,20 @@ services:
   bot:
     build: .
     container_name: vk_music_bot
+    init: true
     env_file: .env
     environment:
       # Провайдер PO-токенов (bgutil) внутри compose-сети
       YTDLP_POT_PROVIDER: http://pot-provider:4416
+      DATA_DIR: /app/data
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - pot-provider
 
@@ -18,3 +25,8 @@ services:
     image: brainicism/bgutil-ytdlp-pot-provider
     container_name: vk_music_pot
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

@@ -1,5 +1,8 @@
 """Хендлер /health — состояние бота (для владельца)."""
 
+import asyncio
+import re
+
 from aiogram import Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -19,6 +22,7 @@ _storage: UserStorage | None = None
 _ytdlp_proxy: str = ""
 _pot_provider: str = ""
 _vk_token: str = ""
+_owner_id: int = 0
 
 
 def set_dependencies(
@@ -27,14 +31,31 @@ def set_dependencies(
     ytdlp_proxy: str,
     pot_provider: str,
     vk_token: str,
+    owner_id: int = 0,
 ) -> None:
     """Прокидывает зависимости из main."""
-    global _cache_mgr, _storage, _ytdlp_proxy, _pot_provider, _vk_token
+    global _cache_mgr, _storage, _ytdlp_proxy, _pot_provider, _vk_token, _owner_id
     _cache_mgr = cache_mgr
     _storage = storage
     _ytdlp_proxy = ytdlp_proxy
     _pot_provider = pot_provider
     _vk_token = vk_token
+    _owner_id = owner_id
+
+
+def _mask_secret(url: str) -> str:
+    """Скрывает логин:пароль в URL прокси."""
+    if not url:
+        return url
+    return re.sub(r"://[^/@]+@", "://***@", url)
+
+
+def _is_owner(uid: int | None) -> bool:
+    """Владелец = OWNER_ID из конфига или первый привязавший канал (если uid известен)."""
+    if uid is None:
+        return False
+    owner = _owner_id or (_storage.get_owner() if _storage else None)
+    return owner is not None and uid == owner
 
 
 def _fmt_uptime(sec: float) -> str:
@@ -57,9 +78,9 @@ async def cmd_health(message: Message):
     if message.chat.type != "private":
         return
 
-    owner = _storage.get_owner() if _storage else None
+    owner = _owner_id or (_storage.get_owner() if _storage else None)
     uid = message.from_user.id if message.from_user else None
-    if owner is not None and uid != owner:
+    if owner is None or uid != owner:
         await message.answer("ℹ️ Команда доступна владельцу.")
         return
 
@@ -69,7 +90,7 @@ async def cmd_health(message: Message):
 
     cache_line = "—"
     if _cache_mgr is not None:
-        cs = _cache_mgr.get_cache_stats()
+        cs = await asyncio.to_thread(_cache_mgr.get_cache_stats)
         cache_line = f"{cs['size_gb']:.2f} ГБ · {cs['files']} файлов"
 
     vk_map = {
@@ -83,13 +104,13 @@ async def cmd_health(message: Message):
 
     tg = health.telegram_mode()
     if tg == "proxy":
-        tg_line = f"через прокси (<code>{health.telegram_proxy()}</code>)"
+        tg_line = f"через прокси (<code>{_mask_secret(health.telegram_proxy())}</code>)"
     elif tg == "direct":
         tg_line = "прямое соединение"
     else:
         tg_line = "—"
 
-    proxy_line = _ytdlp_proxy or "❌ нет"
+    proxy_line = _mask_secret(_ytdlp_proxy) or "❌ нет"
     pot_line = "✅ настроен" if _pot_provider else "❌ нет"
 
     text = (

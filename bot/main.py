@@ -5,6 +5,7 @@ import concurrent.futures
 import os
 import signal
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,9 +25,12 @@ from services import health as health_service
 from services import processor, tg_sender
 from services import rzt as rzt_service
 from utils.config import load_config
+from utils.escape import esc_html
 from utils.logger import get_logger, setup_logging
 from utils.net import proxy_reachable
+from utils.pending import sweeper_loop
 from utils.storage import UserStorage
+from utils.tasks import spawn
 
 _shutdown_event: asyncio.Event | None = None
 _log = None
@@ -134,10 +138,10 @@ async def main():
         capture_exception(exc)
         if _log:
             _log.error("unhandled_exception", error=str(exc))
-        asyncio.create_task(health_service.alert_owner(
-            f"Необработанное исключение:\n<code>{str(exc)[:300]}</code>",
+        spawn(health_service.alert_owner(
+            f"Необработанное исключение:\n<code>{esc_html(str(exc)[:300])}</code>",
             key="unhandled",
-        ))
+        ), name="alert_unhandled")
 
     start.set_storage(storage)
     link.set_storage(storage)
@@ -150,7 +154,7 @@ async def main():
     set_pot_provider(config.ytdlp_pot_provider)
     if config.ytdlp_pot_provider:
         _log.info("pot_provider_enabled", url=config.ytdlp_pot_provider)
-    asyncio.create_task(processor.warm_vk())
+    spawn(processor.warm_vk(), name="warm_vk")
     try:
         me = await bot.me()
         tg_sender.set_bot_username(config.via_username or (me.username or ""))
@@ -165,8 +169,9 @@ async def main():
     health_handler.set_dependencies(
         cache_mgr=cache_mgr, storage=storage,
         ytdlp_proxy=config.ytdlp_proxy, pot_provider=config.ytdlp_pot_provider,
-        vk_token=config.vk_token,
+        vk_token=config.vk_token, owner_id=config.owner_id,
     )
+    stats.set_dependencies(storage, config.owner_id)
     album.set_dependencies(
         storage=storage, ytdlp_proxy=config.ytdlp_proxy, vk_token=config.vk_token,
     )
@@ -202,7 +207,7 @@ async def main():
 
     def create_signal_handler(sig_name: str):
         def handler(sig, frame):
-            asyncio.create_task(_shutdown(sig_name, cache_mgr, bot))
+            spawn(_shutdown(sig_name, cache_mgr, bot), name="shutdown")
         return handler
 
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -227,23 +232,41 @@ async def main():
 
     cleanup_task = asyncio.create_task(cache_cleanup_loop())
 
+    hb_path = os.path.join(config.data_dir, ".heartbeat")
+
     async def heartbeat_loop():
         while not (_shutdown_event and _shutdown_event.is_set()):
             health_service.beat()
+            try:
+                with open(hb_path, "w", encoding="utf-8") as f:
+                    f.write(str(int(time.time())))
+            except OSError:
+                pass
             try:
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
+    spawn(sweeper_loop(300), name="pending_sweeper")
 
-    if config.webhook_mode and config.webhook_url:
+    if config.webhook_mode and config.webhook_url and not config.webhook_secret:
+        _log.error(
+            "webhook_secret_missing",
+            msg="WEBHOOK_SECRET обязателен при WEBHOOK_MODE — без него вебхук открыт для подделки. "
+                "Отключаю вебхук, перехожу на polling.",
+        )
+
+    if config.webhook_mode and config.webhook_url and config.webhook_secret:
         _log.info("starting_webhook", url=config.webhook_url)
         await bot.delete_webhook(drop_pending_updates=True)
         webhook_url = config.webhook_url.rstrip("/") + config.webhook_path
         await bot.set_webhook(url=webhook_url, secret_token=config.webhook_secret)
         from aiohttp import web
         async def handle_webhook(request):
+            if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != config.webhook_secret:
+                _log.warning("webhook_forbidden")
+                return web.Response(text="Forbidden", status=403)
             try:
                 update = await request.json()
                 await dp.feed_webhook_update(bot, update)

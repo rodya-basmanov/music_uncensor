@@ -1,4 +1,4 @@
-"""Хендлер /stats — статистика использования бота."""
+"""Хендлер /stats — статистика использования бота (для владельца)."""
 
 from aiogram import Router
 from aiogram.filters import Command
@@ -6,8 +6,19 @@ from aiogram.types import Message
 
 from services.processor import get_stats
 from utils.rich import send_rich
+from utils.storage import UserStorage
 
 router = Router()
+
+_storage: UserStorage | None = None
+_owner_id: int = 0
+
+
+def set_dependencies(storage: UserStorage, owner_id: int = 0) -> None:
+    """Прокидывает зависимости из main."""
+    global _storage, _owner_id
+    _storage = storage
+    _owner_id = owner_id
 
 
 def _format_time(seconds: int) -> str:
@@ -21,8 +32,14 @@ def _format_time(seconds: int) -> str:
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    """/stats — показывает статистику использования бота."""
+    """/stats — показывает статистику использования бота (владельцу)."""
     if message.chat.type != "private":
+        return
+
+    uid = message.from_user.id if message.from_user else None
+    owner = _owner_id or (_storage.get_owner() if _storage else None)
+    if owner is None or uid != owner:
+        await message.answer("ℹ️ Команда доступна владельцу.")
         return
 
     stats = get_stats()
